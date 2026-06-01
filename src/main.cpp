@@ -15,6 +15,10 @@
  */
 
 #include <Arduino.h>
+// Blynk — wajib include setelah define TEMPLATE_ID di config.h
+#include "config.h"  // BLYNK_TEMPLATE_ID, BLYNK_TEMPLATE_NAME, BLYNK_AUTH_TOKEN
+#define BLYNK_PRINT Serial
+#include <BlynkSimpleEsp32.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -22,13 +26,15 @@
 #include <SPIFFS.h>
 #include <SPI.h>
 #include <SD.h>
+// ESP32 SD library pakai fs::File — sama dengan SPIFFS
+// Tidak perlu typedef, langsung pakai fs::File untuk semua
 #include <Adafruit_Fingerprint.h>
 #include <Wire.h>
 #include "esp_camera.h"
 #include "img_converters.h"
-#include "config.h"
+// config.h sudah diinclude di atas
 
-#define FW_VERSION     "1.4.0"
+#define FW_VERSION     "1.5.0"
 #define WIFI_CFG_FILE  "/wifi.json"
 
 // ============================================================
@@ -133,26 +139,32 @@ bool connectWifi() {
   WifiCfg cfg = loadWifiCfg();
 
   // Dual mode: AP + STA sekaligus
-  // Hotspot selalu aktif (192.168.4.1) + konek ke router
   String apName = "Absensi-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apName.c_str(), "12345678");
   Serial.printf("[AP] Hotspot: %s | IP: %s\n",
     apName.c_str(), WiFi.softAPIP().toString().c_str());
 
-  // Konek ke router
+  // Konek WiFi dulu
   Serial.printf("[WiFi] Connecting: %s", cfg.ssid.c_str());
   WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_TIMEOUT) {
     delay(400); Serial.print(".");
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Client IP: %s\n", WiFi.localIP().toString().c_str());
-    return true;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[WiFi] Router gagal, hotspot tetap aktif");
+    return false;
   }
-  Serial.println("\n[WiFi] Router gagal, hotspot tetap aktif");
-  return false;
+  Serial.printf("\n[WiFi] Client IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // Koneksi ke Blynk server (non-blocking, timeout 5 detik)
+  Serial.print("[BLYNK] Connecting...");
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  bool blynkOk = Blynk.connect(5000);
+  Serial.println(blynkOk ? " OK!" : " Gagal (offline mode)");
+
+  return true;
 }
 
 void startAPMode() {
@@ -567,20 +579,25 @@ bool deleteFP(int id) {
 void kirimBlynk(const String& nama, int id,
                 const String& status, const String& jam) {
   if (!wifiOk) return;
-  HTTPClient http;
-  String base = "https://blynk.cloud/external/api/update?token=";
-  base += BLYNK_TOKEN;
-  String pins[5][2] = {
-    {"V0", nama}, {"V1", String(id)},
-    {"V2", status}, {"V3", jam},
-    {"V4", String(totalHadir)}
-  };
-  for (auto& p : pins) {
-    http.begin(base + "&" + p[0] + "=" + p[1]);
-    http.GET();
-    http.end();
-    delay(80);
+  if (!Blynk.connected()) {
+    Serial.println("[BLYNK] Tidak terkoneksi, skip");
+    return;
   }
+
+  // Sesuai datastream Blynk:
+  // V0 = Nama_Siswa      (String)
+  // V1 = ID_Fingerprint  (Integer 1-30)
+  // V2 = Status          (String)
+  // V3 = Jam_Absensi     (String)
+  // V4 = Total_Hadir     (Integer 0-30)
+  Blynk.virtualWrite(V0, nama);
+  Blynk.virtualWrite(V1, id);
+  Blynk.virtualWrite(V2, status);
+  Blynk.virtualWrite(V3, jam);
+  Blynk.virtualWrite(V4, totalHadir);
+
+  Serial.printf("[BLYNK] Terkirim: %s | ID:%d | %s | %s | Total:%d\n",
+    nama.c_str(), id, status.c_str(), jam.c_str(), totalHadir);
 }
 
 // ============================================================
@@ -1426,6 +1443,9 @@ void setup() {
 // ============================================================
 void loop() {
   server.handleClient();
+
+  // Blynk keep-alive — status online di dashboard
+  if (wifiOk) Blynk.run();
 
   // Skip scan saat enrollment aktif
   if (sysMode == MODE_ENROLLMENT || enroll.active) {

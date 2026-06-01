@@ -7,9 +7,10 @@
 // --- WiFi ---
 #define WIFI_SSID        "Devanda"
 #define WIFI_PASSWORD    "13061906"
-
+#define BLYNK_TEMPLATE_ID "TMPL67t1bjQQr"
+#define BLYNK_TEMPLATE_NAME "Presensi SLB"
 // --- Blynk (notifikasi saja) ---
-#define BLYNK_TOKEN      "YourBlynkAuthToken"
+#define BLYNK_AUTH_TOKEN      "RzElXtyz9bjqAcBDtpV5Ah9ABPDUnFJf" //RzElXtyz9bjqAcBDtpV5Ah9ABPDUnFJf
 #define BLYNK_VPIN_NAMA     V0
 #define BLYNK_VPIN_ID       V1
 #define BLYNK_VPIN_STATUS   V2
