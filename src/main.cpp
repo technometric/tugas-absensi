@@ -32,7 +32,7 @@
 #include "img_converters.h"
 #include "config.h"
 
-#define FW_VERSION     "1.0.0"
+#define FW_VERSION     "1.0.1"
 #define WIFI_CFG_FILE  "/wifi.json"
 
 // ============================================================
@@ -84,8 +84,9 @@ SysMode sysMode = MODE_ABSENSI;
 struct EnrollState {
   bool   active    = false;
   int    id        = -1;
-  String nama      = "";
-  String kelas     = "";
+  String name      = "";   // sesuai Laravel: name
+  String nisn      = "";   // sesuai Laravel: nisn
+  String className = "";   // sesuai Laravel: class_name
   int    step      = 0;
   String statusMsg = "Idle";
 };
@@ -298,9 +299,9 @@ String saveFotoSD(camera_fb_t* fb, int fingerId, const String& tanggal, const St
  * Append log absensi ke CSV harian di SD
  */
 void appendLogSD(const String& tanggal, int fingerId,
-                 const String& nama, const String& kelas,
-                 const String& status, const String& jam,
-                 const String& fotoPath) {
+                 const String& name, const String& nisn,
+                 const String& className, const String& status,
+                 const String& jam, const String& fotoPath) {
   if (!sdOk) return;
   String logFile = String(SD_LOG_DIR) + "/" + tanggal + ".csv";
   bool fileExist = SD.exists(logFile);
@@ -308,12 +309,14 @@ void appendLogSD(const String& tanggal, int fingerId,
   File f = SD.open(logFile, FILE_APPEND);
   if (!f) return;
 
+  // Header CSV sesuai struktur Laravel
   if (!fileExist) {
-    f.println("tanggal,jam,finger_id,nama,kelas,status,foto");
+    f.println("attendance_date,tapped_at,fingerprint_device_id,name,nisn,class_name,status,foto");
   }
-  f.printf("%s,%s,%d,%s,%s,%s,%s\n",
-    tanggal.c_str(), jam.c_str(), fingerId,
-    nama.c_str(), kelas.c_str(), status.c_str(), fotoPath.c_str());
+  f.printf("%s,%s %s,%d,%s,%s,%s,%s,%s\n",
+    tanggal.c_str(), tanggal.c_str(), jam.c_str(), fingerId,
+    name.c_str(), nisn.c_str(), className.c_str(),
+    status.c_str(), fotoPath.c_str());
   f.close();
 }
 
@@ -396,49 +399,60 @@ bool writeStudents(const String& json) {
   return true;
 }
 
-struct SiswaInfo { String nama; String kelas; bool found; };
+struct SiswaInfo { String name; String nisn; String className; bool found; };
 
 SiswaInfo getSiswaById(int id) {
-  SiswaInfo info = {"Unknown", "-", false};
+  SiswaInfo info = {"Unknown", "-", "-", false};
   JsonDocument doc;
   deserializeJson(doc, readStudents());
   for (JsonObject s : doc["students"].as<JsonArray>()) {
-    if (s["id"].as<int>() == id) {
-      info.nama  = s["nama"].as<String>();
-      info.kelas = s["kelas"].as<String>();
-      info.found = true;
+    if (s["fingerprint_device_id"].as<int>() == id) {
+      info.name      = s["name"].as<String>();
+      info.nisn      = s["nisn"].as<String>();
+      info.className = s["class_name"].as<String>();
+      info.found     = true;
       return info;
     }
   }
   return info;
 }
 
-bool addSiswa(int id, const String& nama, const String& kelas) {
+bool addSiswa(int fingerId, const String& name, const String& nisn, const String& className) {
   JsonDocument doc;
   deserializeJson(doc, readStudents());
   JsonArray arr = doc["students"].as<JsonArray>();
+  // Update jika fingerprint_device_id sudah ada
   for (JsonObject s : arr) {
-    if (s["id"].as<int>() == id) {
-      s["nama"] = nama; s["kelas"] = kelas;
+    if (s["fingerprint_device_id"].as<int>() == fingerId) {
+      s["name"]       = name;
+      s["nisn"]       = nisn;
+      s["class_name"] = className;
       String out; serializeJson(doc, out);
       return writeStudents(out);
     }
   }
+  // Tambah baru
   JsonObject ns = arr.add<JsonObject>();
-  ns["id"] = id; ns["nama"] = nama; ns["kelas"] = kelas;
+  ns["fingerprint_device_id"] = fingerId;
+  ns["name"]       = name;
+  ns["nisn"]       = nisn;
+  ns["class_name"] = className;
   String out; serializeJson(doc, out);
   return writeStudents(out);
 }
 
-bool deleteSiswa(int id) {
+bool deleteSiswa(int fingerId) {
   JsonDocument doc;
   deserializeJson(doc, readStudents());
   JsonDocument newDoc;
   JsonArray newArr = newDoc["students"].to<JsonArray>();
   for (JsonObject s : doc["students"].as<JsonArray>()) {
-    if (s["id"].as<int>() != id) {
+    if (s["fingerprint_device_id"].as<int>() != fingerId) {
       JsonObject ns = newArr.add<JsonObject>();
-      ns["id"] = s["id"]; ns["nama"] = s["nama"]; ns["kelas"] = s["kelas"];
+      ns["fingerprint_device_id"] = s["fingerprint_device_id"];
+      ns["name"]       = s["name"];
+      ns["nisn"]       = s["nisn"];
+      ns["class_name"] = s["class_name"];
     }
   }
   String out; serializeJson(newDoc, out);
@@ -450,7 +464,7 @@ int getNextId() {
   deserializeJson(doc, readStudents());
   bool used[128] = {false};
   for (JsonObject s : doc["students"].as<JsonArray>()) {
-    int i = s["id"].as<int>();
+    int i = s["fingerprint_device_id"].as<int>();
     if (i >= 1 && i <= 127) used[i] = true;
   }
   for (int i = 1; i <= 127; i++) if (!used[i]) return i;
@@ -618,24 +632,27 @@ void prosesAbsensi(int fingerId) {
   SiswaInfo info = getSiswaById(fingerId);
   String jam     = getJam();
   String tanggal = getTanggal();
-  String status  = info.found ? "HADIR" : "TIDAK DIKENAL";
+  // Status sesuai Laravel enum: present/sick/permission/absent
+  String status      = info.found ? "present" : "absent";
+  String statusLabel = info.found ? "HADIR"   : "TIDAK DIKENAL";
 
   Serial.printf("[ABSEN] ID:%d | %s | %s | %s\n",
-    fingerId, info.nama.c_str(), status.c_str(), jam.c_str());
+    fingerId, info.name.c_str(), statusLabel.c_str(), jam.c_str());
 
   // Ambil foto + convert RGB565->JPEG + simpan ke SD
   String fotoPath = ambilFotoDanSimpan(fingerId, tanggal, jam);
 
-  // Append log ke SD
-  appendLogSD(tanggal, fingerId, info.nama, info.kelas, status, jam, fotoPath);
+  // Append log ke SD (format sesuai struktur Laravel)
+  appendLogSD(tanggal, fingerId, info.name, info.nisn,
+              info.className, status, jam, fotoPath);
 
-  // Blynk
+  // Blynk notifikasi
   if (info.found) {
     totalHadir++;
-    kirimBlynk(info.nama, fingerId, status, jam);
+    kirimBlynk(info.name, fingerId, statusLabel, jam);
     ledBlink(2, 200);
   } else {
-    kirimBlynk("TIDAK DIKENAL", fingerId, "DITOLAK", jam);
+    kirimBlynk("TIDAK DIKENAL", fingerId, "ALPHA", jam);
     ledBlink(5, 80);
   }
 }
@@ -725,7 +742,9 @@ void handleHome() {
     deserializeJson(doc, logJson);
     for (JsonObject r : doc.as<JsonArray>()) {
       totalRec++;
-      if (String(r["status"].as<const char*>()) == "HADIR") totalHadirToday++;
+      String st = String(r["status"].as<const char*>());
+      if (st == "present") totalHadirToday++;
+      // sick & permission juga dihitung kehadiran (tidak alpha)
       else totalTolak++;
     }
   }
@@ -755,8 +774,8 @@ void handleHome() {
   body += "if(!data||data.length===0){el.innerHTML='<p style=\"color:#999;padding:20px\">📭 Belum ada absensi hari ini</p>';}";
   body += "else{el.innerHTML='';data.reverse().forEach(function(d){";
   body += "var foto=d.foto_url?'<img src=\"'+d.foto_url+'\" onerror=\"this.outerHTML=\\'<div class=avi>👤</div>\\'\">':`<div class='avi'>👤</div>`;";
-  body += "var bc=d.status==='HADIR'?'bh':'bd';";
-  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+d.nama+'</div><div class=kl>'+d.kelas+'</div><span class=\"badge '+bc+'\">'+d.status+'</span><div class=jm>🕐 '+d.jam+'</div><div class=fid>ID: '+d.finger_id+'</div></div>';";
+  body += "var bc=d.status_label==='HADIR'?'bh':(d.status_label==='SAKIT'?'bh':d.status_label==='IZIN'?'bh':'bd');";
+  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+d.name+'</div><div class=kl>'+d.class_name+'</div><span class=\"badge '+bc+'\">'+d.status_label+'</span><div class=jm>🕐 '+d.tapped_at+'</div><div class=fid>ID: '+d.fingerprint_device_id+'</div></div>';";
   body += "});}";
   body += "</script></div>";
 
@@ -777,9 +796,19 @@ void handleEnroll() {
   } else {
     body += "<div id='msg'></div>";
     body += "<label>Nama Siswa</label>";
-    body += "<input type='text' id='nama' placeholder='Contoh: Budi Santoso'>";
-    body += "<label>Kelas</label>";
-    body += "<input type='text' id='kelas' placeholder='Contoh: X-A'>";
+    body += "<input type='text' id='ename' placeholder='Contoh: Budi Santoso'>";
+    body += "<label>NISN</label>";
+    body += "<input type='text' id='enisn' placeholder='Contoh: 1234567890' maxlength='10'>";
+    body += "<label>Kelas / Jenis Kebutuhan Khusus</label>";
+    body += "<select id='eclass'>";
+    body += "<option value='Autis'>Autis</option>";
+    body += "<option value='Tuna Rungu'>Tuna Rungu</option>";
+    body += "<option value='Tuna Grahita'>Tuna Grahita</option>";
+    body += "<option value='Tuna Daksa'>Tuna Daksa</option>";
+    body += "<option value='Tuna Netra'>Tuna Netra</option>";
+    body += "<option value='Tuna Wicara'>Tuna Wicara</option>";
+    body += "<option value='Lainnya'>Lainnya</option>";
+    body += "</select>";
     body += "<label>ID Finger (1-127)</label>";
     body += "<input type='number' id='fid' value='" + String(nextId) + "' min='1' max='127'>";
     body += "<button class='btn bg' onclick='mulaiEnroll()'>🚀 Mulai Enrollment</button>";
@@ -799,12 +828,13 @@ void handleEnroll() {
   body += "<script>";
   body += "function showMsg(t,c){var m=document.getElementById('msg');m.textContent=t;m.className=c;m.style.display='block';}";
   body += "function mulaiEnroll(){";
-  body += "  var n=document.getElementById('nama').value.trim();";
-  body += "  var k=document.getElementById('kelas').value.trim();";
+  body += "  var n=document.getElementById('ename').value.trim();";
+  body += "  var ns=document.getElementById('enisn').value.trim();";
+  body += "  var k=document.getElementById('eclass').value;";
   body += "  var i=document.getElementById('fid').value;";
-  body += "  if(!n||!k||!i){showMsg('⚠️ Lengkapi semua field!','info msg');return;}";
+  body += "  if(!n||!i){showMsg('⚠️ Nama dan ID wajib diisi!','info msg');return;}";
   body += "  showMsg('⏳ Memulai enrollment...','info msg');";
-  body += "  fetch('/enroll-start?nama='+encodeURIComponent(n)+'&kelas='+encodeURIComponent(k)+'&id='+i)";
+  body += "  fetch('/enroll-start?name='+encodeURIComponent(n)+'&nisn='+encodeURIComponent(ns)+'&class_name='+encodeURIComponent(k)+'&id='+i)";
   body += "  .then(r=>r.json()).then(d=>{";
   body += "    showMsg(d.message, d.ok?'suc msg':'fail msg');";
   body += "    if(d.ok) pollEnroll();";
@@ -823,21 +853,23 @@ void handleEnroll() {
 }
 
 void handleEnrollStart() {
-  String nama  = server.arg("nama");
-  String kelas = server.arg("kelas");
-  int id       = server.arg("id").toInt();
+  String name      = server.arg("name");
+  String nisn      = server.arg("nisn");
+  String className = server.arg("class_name");
+  int id           = server.arg("id").toInt();
 
   JsonDocument resp;
-  if (nama.isEmpty() || kelas.isEmpty() || id < 1 || id > 127) {
-    resp["ok"] = false; resp["message"] = "Data tidak valid!";
+  if (name.isEmpty() || id < 1 || id > 127) {
+    resp["ok"] = false; resp["message"] = "Nama dan ID wajib diisi!";
   } else if (enroll.active) {
     resp["ok"] = false; resp["message"] = "Enrollment lain sedang berjalan!";
   } else {
-    enroll.active = true;
-    enroll.id     = id;
-    enroll.nama   = nama;
-    enroll.kelas  = kelas;
-    enroll.step   = 1;
+    enroll.active    = true;
+    enroll.id        = id;
+    enroll.name      = name;
+    enroll.nisn      = nisn;
+    enroll.className = className;
+    enroll.step      = 1;
     enroll.statusMsg = "👆 Tempelkan jari PERTAMA ke sensor...";
     sysMode = MODE_ENROLLMENT;
     resp["ok"]      = true;
@@ -884,11 +916,11 @@ void handleEnrollPoll() {
           if (p == FINGERPRINT_OK) {
             p = finger.storeModel(enroll.id);
             if (p == FINGERPRINT_OK) {
-              addSiswa(enroll.id, enroll.nama, enroll.kelas);
+              addSiswa(enroll.id, enroll.name, enroll.nisn, enroll.className);
               enroll.active = false;
               sysMode = MODE_ABSENSI;
               resp["done"] = true; resp["success"] = true;
-              resp["message"] = "✅ Enrollment berhasil! " + enroll.nama + " terdaftar.";
+              resp["message"] = "✅ Enrollment berhasil! " + enroll.name + " terdaftar.";
               ledBlink(3, 150);
             } else {
               enroll.active = false; sysMode = MODE_ABSENSI;
@@ -1000,35 +1032,54 @@ void handleLogView() {
       while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
-        if (first) { first = false; continue; }
+        if (first) { first = false; continue; } // skip header CSV
         if (line.isEmpty()) continue;
-        // Parse: tanggal,jam,finger_id,nama,kelas,status,foto
-        String fields[7]; int col = 0, prev = 0;
-        for (int i = 0; i <= line.length() && col < 7; i++) {
-          if (i == line.length() || line[i] == ',') {
+
+        // CSV: attendance_date,tapped_at,finger_id,name,nisn,class_name,status,foto
+        // index:      0            1          2      3    4       5        6     7
+        String fields[8];  // 8 kolom!
+        int col = 0, prev = 0;
+        for (int i = 0; i <= (int)line.length() && col < 8; i++) {
+          if (i == (int)line.length() || line[i] == ',') {
             fields[col++] = line.substring(prev, i);
             prev = i + 1;
           }
         }
-        String fotoUrl = fields[6].length() > 0 ? "/foto?path=" + fields[6] : "";
-        String fotoHtml = fotoUrl.length() > 0
-          ? "<img src='" + fotoUrl + "' onerror=\"this.outerHTML='<div class=avi>👤</div>'\">"
-          : "<div class='avi'>👤</div>";
-        String bc = fields[5] == "HADIR" ? "bh" : "bd";
+
+        // Foto
+        String fotoHtml = "";
+        if (fields[7].length() > 0) {
+          String fotoUrl = "/foto?path=" + fields[7];
+          fotoHtml = "<img src='" + fotoUrl + "' style='width:80px;height:80px;border-radius:50%;object-fit:cover;border:3px solid #1a73e8;margin-bottom:8px'>";
+        } else {
+          fotoHtml = "<div class='avi'>👤</div>";
+        }
+
+        // Status label
+        String stLabel = fields[6];
+        if      (stLabel == "present")    stLabel = "HADIR";
+        else if (stLabel == "sick")       stLabel = "SAKIT";
+        else if (stLabel == "permission") stLabel = "IZIN";
+        else if (stLabel == "absent")     stLabel = "ALPHA";
+
+        String bc = (fields[6]=="present"||fields[6]=="sick"||fields[6]=="permission") ? "bh" : "bd";
+
         body += "<div class='scard'>" + fotoHtml;
-        body += "<div class='nm'>" + fields[3] + "</div>";
-        body += "<div class='kl'>" + fields[4] + "</div>";
-        body += "<span class='badge " + bc + "'>" + fields[5] + "</span>";
+        body += "<div class='nm'>"    + fields[3] + "</div>";
+        body += "<div class='kl'>"    + fields[5] + "</div>";
+        body += "<span class='badge " + bc + "'>" + stLabel + "</span>";
         body += "<div class='jm'>🕐 " + fields[1] + "</div>";
-        body += "<div class='fid'>ID: " + fields[2] + "</div></div>";
+        body += "<div class='fid'>ID: " + fields[2] + " | NISN: " + fields[4] + "</div>";
+        body += "</div>";  // tutup scard
       }
-      body += "</div>";
+      body += "</div>";  // tutup grid
       f.close();
     }
   }
-  body += "</div>";
+  body += "</div>";  // tutup card
   server.send(200, "text/html", pageWrap("Log View", "log", body));
 }
+
 
 // ============================================================
 //   ROUTE: SERVE FOTO DARI SD
@@ -1061,7 +1112,8 @@ void handleApi() {
   JsonDocument doc;
   deserializeJson(doc, logJson);
   for (JsonObject r : doc.as<JsonArray>()) {
-    if (String(r["status"].as<const char*>()) == "HADIR") totalHadirToday++;
+    String st = String(r["status"].as<const char*>());
+    if (st == "present" || st == "sick" || st == "permission") totalHadirToday++;
     else totalTolak++;
   }
   String resp = "{";
@@ -1407,7 +1459,8 @@ void handleCamPage() {
 //   SETUP
 // ============================================================
 void setup() {
-  Serial.begin(115200);
+  //Serial.begin(115200);
+  Serial.begin(115200, SERIAL_8N1, -1, 1);
   Serial.println("\n===================================");
   Serial.println("  SISTEM ABSENSI PURE ESP32-CAM");
   Serial.println("===================================");

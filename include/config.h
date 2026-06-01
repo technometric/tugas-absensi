@@ -18,8 +18,8 @@
 
 // --- Pin AS608 Fingerprint ---
 // UART1 ESP32-CAM — pin aman yang tidak konflik kamera
-#define FP_RX_PIN   14   // GPIO14 → TX AS608
-#define FP_TX_PIN   15   // GPIO15 → RX AS608
+#define FP_RX_PIN   3    // GPIO14 → TX AS608
+#define FP_TX_PIN   12   // GPIO15 → RX AS608
 #define FP_BAUD     57600
 
 // --- SD Card (ESP32-CAM AI Thinker built-in) ---
