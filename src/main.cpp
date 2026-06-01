@@ -133,28 +133,32 @@ bool saveWifiCfg(const String& ssid, const String& pass) {
 
 bool connectWifi() {
   WifiCfg cfg = loadWifiCfg();
-  Serial.printf("[WiFi] Connecting: %s\n", cfg.ssid.c_str());
-  WiFi.mode(WIFI_STA);
+
+  // Dual mode: AP + STA sekaligus
+  // Hotspot selalu aktif (192.168.4.1) + konek ke router
+  String apName = "Absensi-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apName.c_str(), "12345678");
+  Serial.printf("[AP] Hotspot: %s | IP: %s\n",
+    apName.c_str(), WiFi.softAPIP().toString().c_str());
+
+  // Konek ke router
+  Serial.printf("[WiFi] Connecting: %s", cfg.ssid.c_str());
   WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_TIMEOUT) {
     delay(400); Serial.print(".");
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\n[WiFi] Client IP: %s\n", WiFi.localIP().toString().c_str());
     return true;
   }
-  Serial.println("\n[WiFi] Gagal!");
+  Serial.println("\n[WiFi] Router gagal, hotspot tetap aktif");
   return false;
 }
 
 void startAPMode() {
-  String apName = "AbsensiSetup-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(apName.c_str(), "12345678");
-  apMode = true;
-  Serial.printf("[AP] SSID: %s | Pass: 12345678 | IP: %s\n",
-    apName.c_str(), WiFi.softAPIP().toString().c_str());
+  // Tidak dipakai lagi — AP selalu aktif via WIFI_AP_STA di connectWifi()
 }
 
 // ============================================================
@@ -1200,33 +1204,58 @@ void handleOtaUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    Serial.printf("[OTA] Start: %s (%d bytes)", upload.filename.c_str(), upload.totalSize);
+    Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
     otaUploaded = 0;
+
+    // ⚠️ Unmount SD Card dulu — cegah timeout conflict saat OTA
+    if (sdOk) {
+      SD_MMC.end();
+      Serial.println("[OTA] SD Card di-unmount sementara");
+    }
+
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
-      server.send(500, "text/plain", "OTA begin gagal!");
+      // Remount SD jika OTA gagal start
+      if (sdOk) SD_MMC.begin("/sdcard", true);
       return;
     }
+    Serial.println("[OTA] Update dimulai...");
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
     otaUploaded += upload.currentSize;
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
-      server.send(500, "text/plain", "OTA write error!");
       return;
     }
-    Serial.printf("[OTA] Progress: %d bytes", otaUploaded);
+    // Print progress tiap 50KB biar tidak spam serial
+    if (otaUploaded % 51200 < upload.currentSize) {
+      Serial.printf("[OTA] %d KB diterima...\n", otaUploaded / 1024);
+    }
   }
   else if (upload.status == UPLOAD_FILE_END) {
     if (Update.end(true)) {
-      Serial.printf("[OTA] ✅ Selesai! %d bytes. Restart...", upload.totalSize);
+      Serial.printf("[OTA] ✅ Selesai! %d bytes. Restart...\n", upload.totalSize);
       server.send(200, "text/plain", "OK! Restart dalam 3 detik...");
       delay(3000);
       ESP.restart();
     } else {
       Update.printError(Serial);
-      server.send(500, "text/plain", "OTA end gagal!");
+      // Remount SD jika OTA gagal
+      if (sdOk) {
+        SD_MMC.begin("/sdcard", true);
+        Serial.println("[OTA] SD Card di-remount");
+      }
+      server.send(500, "text/plain", "OTA gagal! Coba lagi.");
     }
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    // Remount SD jika OTA dibatalkan
+    if (sdOk) {
+      SD_MMC.begin("/sdcard", true);
+      Serial.println("[OTA] Dibatalkan — SD Card di-remount");
+    }
+    Serial.println("[OTA] Upload dibatalkan!");
   }
 }
 
@@ -1356,9 +1385,10 @@ void setup() {
     Serial.println("[NTP] Sinkronisasi waktu...");
     ledBlink(3, 100);
   } else {
-    startAPMode();  // Fallback: jadi hotspot setup
-    ledBlink(10, 100);
+    ledBlink(10, 100);  // AP mode sudah aktif dari connectWifi()
   }
+
+
 
   // Web Server Routes
   server.on("/",             handleHome);
@@ -1384,9 +1414,30 @@ void setup() {
   server.on("/cam",          handleCamPage);
   server.begin();
 
-  Serial.println("[WEB] Server ready!");
-  Serial.printf("[WEB] → http://%s\n", WiFi.localIP().toString().c_str());
-  Serial.println("===================================\n");
+  // Tampilkan semua cara akses
+  String staIp = WiFi.localIP().toString();
+  String apIp  = WiFi.softAPIP().toString();
+  String apSSID = "Absensi-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  Serial.println();
+  Serial.println("=========================================");
+  Serial.println("  SISTEM ABSENSI SIAP!");
+  Serial.println("-----------------------------------------");
+  if (wifiOk) {
+    Serial.printf("  [Router]  SSID : %s\n", WiFi.SSID().c_str());
+    Serial.printf("  [Router]  IP   : http://%s\n", staIp.c_str());
+    } else {
+    Serial.println("  [Router]  GAGAL konek");
+  }
+  Serial.println("-----------------------------------------");
+  Serial.printf("  [Hotspot] SSID : %s\n", apSSID.c_str());
+  Serial.printf("  [Hotspot] Pass : 12345678\n");
+  Serial.printf("  [Hotspot] IP   : http://%s\n", apIp.c_str());
+  Serial.println("-----------------------------------------");
+  Serial.println("  URL Penting:");
+  Serial.println("  /          -> Dashboard Absensi");
+  Serial.println("  /cam       -> Live Camera");
+  Serial.println("  /setting   -> WiFi & OTA Update");
+  Serial.println("=========================================");
 }
 
 // ============================================================
