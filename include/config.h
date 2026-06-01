@@ -70,5 +70,15 @@
 #define SCAN_COOLDOWN   3000   // ms antara scan yang sama
 #define PHOTO_DELAY     300    // ms sebelum capture
 
+// --- VPS Upload Foto ---
+#define VPS_HOST        "https://dsweetea.my.id"  // ganti domain/IP VPS
+#define VPS_UPLOAD_PATH "/upload-foto"
+#define VPS_SECRET_KEY  "rahasia123"  // sama dengan SECRET_KEY di app.py
+#define VPS_ENABLED     true  // set true jika VPS sudah siap
+
+// --- Blynk Image Pin ---
+#define BLYNK_VPIN_FOTO V5   // Image Gallery widget
+
+
 // --- Web Server ---
 #define HTTP_PORT       80

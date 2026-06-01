@@ -34,7 +34,7 @@
 #include "img_converters.h"
 // config.h sudah diinclude di atas
 
-#define FW_VERSION     "1.5.0"
+#define FW_VERSION     "1.5.1"
 #define WIFI_CFG_FILE  "/wifi.json"
 
 // ============================================================
@@ -549,6 +549,44 @@ String ambilFotoDanSimpan(int fingerId, const String& tanggal, const String& jam
 }
 
 // ============================================================
+//   UPLOAD FOTO KE VPS
+// ============================================================
+String uploadFotoVPS(const uint8_t* jpg_buf, size_t jpg_len,
+                     int fingerId, const String& nama,
+                     const String& tanggal, const String& jam) {
+  if (!VPS_ENABLED || !wifiOk || !jpg_buf) return "";
+
+  HTTPClient http;
+  String url = String(VPS_HOST) + VPS_UPLOAD_PATH;
+
+  http.begin(url);
+  http.addHeader("Content-Type",    "image/jpeg");
+  http.addHeader("X-Secret-Key",    VPS_SECRET_KEY);
+  http.addHeader("X-Finger-ID",     String(fingerId));
+  http.addHeader("X-Nama",          nama);
+  http.addHeader("X-Tanggal",       tanggal);
+  http.addHeader("X-Jam",           jam);
+
+  int code = http.POST((uint8_t*)jpg_buf, jpg_len);
+  Serial.printf("[VPS] Upload response: %d\n", code);
+
+  String fotoUrl = "";
+  if (code == 200) {
+    String resp = http.getString();
+    // Parse JSON response: {"ok":true,"url":"https://..."}
+    JsonDocument doc;
+    if (!deserializeJson(doc, resp)) {
+      fotoUrl = doc["url"].as<String>();
+      Serial.printf("[VPS] URL: %s\n", fotoUrl.c_str());
+    }
+  } else {
+    Serial.printf("[VPS] Gagal upload: %d\n", code);
+  }
+  http.end();
+  return fotoUrl;
+}
+
+// ============================================================
 //   FINGERPRINT
 // ============================================================
 bool initFingerprint() {
@@ -614,10 +652,34 @@ void prosesAbsensi(int fingerId) {
   Serial.printf("[ABSEN] ID:%d | %s | %s | %s\n",
     fingerId, info.name.c_str(), statusLabel.c_str(), jam.c_str());
 
-  // Ambil foto + convert RGB565->JPEG + simpan ke SD
-  String fotoPath = ambilFotoDanSimpan(fingerId, tanggal, jam);
+  // Ambil foto + convert RGB565->JPEG
+  camera_fb_t* fb = ambilFoto();
+  String fotoPath = "";
+  String fotoUrl  = "";
 
-  // Append log ke SD (format sesuai struktur Laravel)
+  if (fb) {
+    // Convert RGB565 → JPEG
+    uint8_t* jpg_buf = NULL;
+    size_t   jpg_len = 0;
+    bool conv = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+    esp_camera_fb_return(fb);
+
+    if (conv && jpg_buf) {
+      // Simpan ke SD Card
+      String jamClean = jam; jamClean.replace(":", "");
+      fotoPath = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
+      fs::File f = SD.open(fotoPath, FILE_WRITE);
+      if (f) { f.write(jpg_buf, jpg_len); f.close(); }
+      else fotoPath = "";
+
+      // Upload ke VPS (jika enabled)
+      fotoUrl = uploadFotoVPS(jpg_buf, jpg_len, fingerId,
+                              info.name, tanggal, jam);
+      free(jpg_buf);
+    }
+  }
+
+  // Append log ke SD
   appendLogSD(tanggal, fingerId, info.name, info.nisn,
               info.className, status, jam, fotoPath);
 
@@ -625,6 +687,11 @@ void prosesAbsensi(int fingerId) {
   if (info.found) {
     totalHadir++;
     kirimBlynk(info.name, fingerId, statusLabel, jam);
+    // Kirim URL foto ke Blynk V5 jika ada
+    if (fotoUrl.length() > 0) {
+      Blynk.virtualWrite(V5, fotoUrl);
+      Serial.printf("[BLYNK] Foto URL → V5: %s\n", fotoUrl.c_str());
+    }
     ledBlink(2, 200);
   } else {
     kirimBlynk("TIDAK DIKENAL", fingerId, "ALPHA", jam);
