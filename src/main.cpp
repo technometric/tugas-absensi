@@ -22,20 +22,13 @@
 #include <SPIFFS.h>
 #include <SPI.h>
 #include <SD.h>
-// ESP32 SD library pakai fs::File — sama dengan SPIFFS
-// Tidak perlu typedef, langsung pakai fs::File untuk semua
 #include <Adafruit_Fingerprint.h>
-#include <Update.h>
 #include <Wire.h>
-#include "esp_vfs_fat.h"
-#include "driver/sdspi_host.h"
-#include "sdmmc_cmd.h"
 #include "esp_camera.h"
-#include "esp_ota_ops.h"
 #include "img_converters.h"
 #include "config.h"
 
-#define FW_VERSION     "1.3.3"
+#define FW_VERSION     "1.4.0"
 #define WIFI_CFG_FILE  "/wifi.json"
 
 // ============================================================
@@ -103,9 +96,6 @@ bool camOk       = false;
 bool wifiOk      = false;
 bool apMode      = false;
 
-// OTA progress
-size_t otaContentLen = 0;
-size_t otaUploaded   = 0;
 
 // ============================================================
 //   WIFI CONFIG — BACA/TULIS SSID+PASS DI SPIFFS
@@ -206,56 +196,16 @@ void ledBlink(int n, int ms = 200) {
 }
 
 // ============================================================
-//   SD CARD — 1-BIT MODE (hanya butuh GPIO 2)
+//   SD CARD — SPI MODE
 // ============================================================
 bool initSD() {
-  // SPI mode — lebih stabil dengan WiFi AP+STA
-  // Pin SPI ESP32-CAM: SCK=14, MISO=2, MOSI=15, CS=13
+  // Pin SPI: SCK=14, MISO=2, MOSI=15, CS=13
   SPI.begin(14, 2, 15, 13);
 
-  // Coba mount dulu
   if (!SD.begin(13)) {
-    Serial.println("[SD] Gagal mount! Coba format FAT32...");
-
-    // Format otomatis pakai esp_vfs_fat
-    // Lepas SPI dulu, coba via SD_MMC untuk format
-    SD.end();
-
-    // Pakai ff_mkfs dari fatfs untuk format
-    FATFS fs;
-    FRESULT res;
-    const char* path = "/sdcard";
-
-    // Mount paksa untuk format
-    esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
-      .format_if_mount_failed = true,  // ← auto format jika gagal!
-      .max_files = 5,
-      .allocation_unit_size = 16 * 1024
-    };
-
-    sdmmc_card_t* card;
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = HSPI_HOST;
-
-    sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_cfg.gpio_cs   = (gpio_num_t)13;
-    slot_cfg.host_id   = (spi_host_device_t)host.slot;
-
-    esp_err_t err = esp_vfs_fat_sdspi_mount(path, &host, &slot_cfg, &mount_cfg, &card);
-    if (err == ESP_OK) {
-      Serial.println("[SD] Format & mount berhasil!");
-      esp_vfs_fat_sdcard_unmount(path, card);
-      // Remount via Arduino SD library
-      SPI.begin(14, 2, 15, 13);
-      if (!SD.begin(13)) {
-        Serial.println("[SD] Remount gagal setelah format");
-        return false;
-      }
-    } else {
-      Serial.printf("[SD] Format gagal: 0x%x\n", err);
-      Serial.println("[SD] Kemungkinan: SD tidak terpasang / rusak");
-      return false;
-    }
+    Serial.println("[SD] Gagal mount!");
+    Serial.println("[SD] Cek: format FAT32? SD terpasang?");
+    return false;
   }
 
   uint8_t cardType = SD.cardType();
@@ -264,7 +214,6 @@ bool initSD() {
     return false;
   }
 
-  // Info SD Card
   String typeStr = "UNKNOWN";
   if      (cardType == CARD_MMC)  typeStr = "MMC";
   else if (cardType == CARD_SD)   typeStr = "SD";
@@ -1301,148 +1250,6 @@ void handleWifiScan() {
 }
 
 // ============================================================
-//   ROUTE: OTA UPDATE
-// ============================================================
-void handleOtaPage() {
-  String body = "<div class='card'><h2>🔄 OTA Firmware Update</h2>";
-  body += "<p>Versi firmware saat ini: <span class='chip'>v" FW_VERSION "</span></p>";
-  body += "<hr style='margin:14px 0'>";
-  body += "<p style='margin-bottom:12px'>Upload file <b>.bin</b> firmware baru:</p>";
-
-  // Form upload — pakai raw HTTP, bukan form tag
-  body += "<div id='otaArea'>";
-  body += "<input type='file' id='fwFile' accept='.bin' onchange='piliFile(this)'>";
-  body += "<br><br>";
-  body += "<button class='btn bg' id='btnUpload' onclick='uploadFW()' disabled>⬆️ Upload Firmware</button>";
-  body += "</div>";
-
-  body += "<div id='otaProgress' style='display:none;margin-top:15px'>";
-  body += "<div style='background:#f0f2f5;border-radius:8px;overflow:hidden;height:24px'>";
-  body += "<div id='progBar' style='background:#1a73e8;height:100%;width:0%;transition:width 0.3s;display:flex;align-items:center;justify-content:center;color:white;font-size:12px'>0%</div>";
-  body += "</div>";
-  body += "<p id='otaMsg' style='margin-top:8px;color:#666'>Mempersiapkan...</p>";
-  body += "</div>";
-
-  body += "</div>";
-
-  body += "<div class='card'><h2>⚠️ Perhatian</h2>";
-  body += "<ul style='line-height:2;padding-left:20px;color:#555'>";
-  body += "<li>Gunakan file <b>.bin</b> dari PlatformIO (<code>.pio/build/esp32cam/firmware.bin</code>)</li>";
-  body += "<li>Jangan matikan daya saat update berlangsung</li>";
-  body += "<li>ESP32 akan <b>restart otomatis</b> setelah update berhasil</li>";
-  body += "<li>Jika gagal, flash ulang via USB seperti biasa</li>";
-  body += "</ul></div>";
-
-  body += "<script>";
-  body += "var selFile=null;";
-  body += "function piliFile(input){";
-  body += "  selFile=input.files[0];";
-  body += "  if(selFile){";
-  body += "    document.getElementById('btnUpload').disabled=false;";
-  body += "    document.getElementById('btnUpload').textContent='⬆️ Upload: '+selFile.name+' ('+Math.round(selFile.size/1024)+' KB)';";
-  body += "  }";
-  body += "}";
-  body += "function uploadFW(){";
-  body += "  if(!selFile){alert('Pilih file .bin dulu!');return;}";
-  body += "  if(!confirm('Upload firmware baru? ESP32 akan restart setelah selesai.')){return;}";
-  body += "  document.getElementById('otaArea').style.display='none';";
-  body += "  document.getElementById('otaProgress').style.display='block';";
-  body += "  var xhr=new XMLHttpRequest();";
-  body += "  xhr.open('POST','/ota-upload',true);";
-  body += "  xhr.upload.onprogress=function(e){";
-  body += "    if(e.lengthComputable){";
-  body += "      var pct=Math.round(e.loaded/e.total*100);";
-  body += "      document.getElementById('progBar').style.width=pct+'%';";
-  body += "      document.getElementById('progBar').textContent=pct+'%';";
-  body += "      document.getElementById('otaMsg').textContent='Uploading... '+pct+'%';";
-  body += "    }";
-  body += "  };";
-  body += "  xhr.onload=function(){";
-  body += "    if(xhr.status===200){";
-  body += "      document.getElementById('otaMsg').textContent='✅ Update berhasil! ESP32 restart...';";
-  body += "      document.getElementById('progBar').style.background='#34a853';";
-  body += "      setTimeout(()=>{location.href='/';},8000);";
-  body += "    } else {";
-  body += "      document.getElementById('otaMsg').textContent='❌ Gagal: '+xhr.responseText;";
-  body += "      document.getElementById('progBar').style.background='#ea4335';";
-  body += "      document.getElementById('otaArea').style.display='block';";
-  body += "    }";
-  body += "  };";
-  body += "  xhr.onerror=function(){";
-  body += "    document.getElementById('otaMsg').textContent='❌ Koneksi terputus (mungkin sudah restart)';";
-  body += "    setTimeout(()=>location.href='/',5000);";
-  body += "  };";
-  body += "  xhr.setRequestHeader('X-Filename', selFile.name);";
-  body += "  xhr.send(selFile);";
-  body += "}";
-  body += "</script>";
-
-  server.send(200, "text/html", pageWrap("OTA Update", "setting", body));
-}
-
-void handleOtaUpload() {
-  HTTPUpload& upload = server.upload();
-
-  if (upload.status == UPLOAD_FILE_START) {
-    Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
-    otaUploaded = 0;
-
-    // Bebaskan RAM semaksimal mungkin sebelum OTA
-    if (sdOk)  { SD.end();  Serial.println("[OTA] SD unmount"); }
-    if (camOk) { esp_camera_deinit(); Serial.println("[OTA] Kamera deinit"); }
-
-    // Cek free heap sebelum mulai
-    Serial.printf("[OTA] Free heap: %d bytes\n", ESP.getFreeHeap());
-
-    // Hitung ukuran partisi OTA yang tersedia
-    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
-    size_t ota_size = update_partition ? update_partition->size : UPDATE_SIZE_UNKNOWN;
-    Serial.printf("[OTA] Partisi tersedia: %d bytes\n", ota_size);
-
-    if (!Update.begin(ota_size)) {
-      Update.printError(Serial);
-      // Remount
-      SPI.begin(14, 2, 15, 13);
-      if (sdOk) SD.begin(SD_CS_PIN);
-      camOk = initCamera();
-      return;
-    }
-    Serial.println("[OTA] Update dimulai...");
-  }
-  else if (upload.status == UPLOAD_FILE_WRITE) {
-    otaUploaded += upload.currentSize;
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Update.printError(Serial);
-      return;
-    }
-    if (otaUploaded % 51200 < upload.currentSize) {
-      Serial.printf("[OTA] %d KB...\n", otaUploaded / 1024);
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) {
-      Serial.printf("[OTA] ✅ Selesai! %d bytes. Restart...\n", upload.totalSize);
-      server.send(200, "text/plain", "OK! Restart dalam 3 detik...");
-      delay(3000);
-      ESP.restart();
-    } else {
-      Update.printError(Serial);
-      SPI.begin(14, 2, 15, 13);
-      if (sdOk) SD.begin(SD_CS_PIN);
-      camOk = initCamera();
-      server.send(500, "text/plain", "OTA gagal! Coba lagi.");
-    }
-  }
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Update.abort();
-    SPI.begin(14, 2, 15, 13);
-    if (sdOk) SD.begin(SD_CS_PIN);
-    camOk = initCamera();
-    Serial.println("[OTA] Upload dibatalkan!");
-  }
-}
-
-// ============================================================
 //   ROUTE: HALAMAN PENGATURAN (Hub)
 // ============================================================
 void handleSetting() {
@@ -1457,13 +1264,7 @@ void handleSetting() {
   body += "<a href='/wifi-config' class='btn bb'>Buka Pengaturan</a>";
   body += "</div>";
 
-  // OTA Card
-  body += "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px'>";
-  body += "<div style='font-size:28px;margin-bottom:8px'>🔄</div>";
-  body += "<h3 style='margin-bottom:6px'>OTA Firmware Update</h3>";
-  body += "<p style='color:#666;font-size:13px;margin-bottom:12px'>Upload firmware baru via browser tanpa kabel USB</p>";
-  body += "<a href='/ota' class='btn bg'>Buka OTA Update</a>";
-  body += "</div>";
+
 
   // Info Card
   body += "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px'>";
@@ -1590,11 +1391,6 @@ void setup() {
   server.on("/wifi-config",  handleWifiConfig);
   server.on("/wifi-save",    handleWifiSave);
   server.on("/wifi-scan",    handleWifiScan);
-  server.on("/ota",          handleOtaPage);
-  server.on("/ota-upload",   HTTP_POST,
-    []() { server.send(200, "text/plain", "OK"); },
-    handleOtaUpload
-  );
   server.on("/stream",       handleStream);
   server.on("/cam",          handleCamPage);
   server.begin();
@@ -1621,7 +1417,7 @@ void setup() {
   Serial.println("  URL Penting:");
   Serial.println("  /          -> Dashboard Absensi");
   Serial.println("  /cam       -> Live Camera");
-  Serial.println("  /setting   -> WiFi & OTA Update");
+  Serial.println("  /setting   -> Pengaturan WiFi");
   Serial.println("=========================================");
 }
 
