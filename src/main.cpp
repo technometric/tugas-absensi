@@ -20,8 +20,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
-#include <SD.h>
 #include <SPI.h>
+#include <SD.h>
+// ESP32 SD library pakai fs::File — sama dengan SPIFFS
+// Tidak perlu typedef, langsung pakai fs::File untuk semua
 #include <Adafruit_Fingerprint.h>
 #include <Update.h>
 #include <Wire.h>
@@ -29,10 +31,11 @@
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_camera.h"
+#include "esp_ota_ops.h"
 #include "img_converters.h"
 #include "config.h"
 
-#define FW_VERSION     "1.0.1"
+#define FW_VERSION     "1.3.3"
 #define WIFI_CFG_FILE  "/wifi.json"
 
 // ============================================================
@@ -113,7 +116,7 @@ struct WifiCfg { String ssid; String pass; };
 WifiCfg loadWifiCfg() {
   WifiCfg cfg = {WIFI_SSID, WIFI_PASSWORD};
   if (!SPIFFS.exists(WIFI_CFG_FILE)) return cfg;
-  File f = SPIFFS.open(WIFI_CFG_FILE, FILE_READ);
+  fs::File f = SPIFFS.open(WIFI_CFG_FILE, FILE_READ);
   if (!f) return cfg;
   JsonDocument doc;
   if (!deserializeJson(doc, f)) {
@@ -125,7 +128,7 @@ WifiCfg loadWifiCfg() {
 }
 
 bool saveWifiCfg(const String& ssid, const String& pass) {
-  File f = SPIFFS.open(WIFI_CFG_FILE, FILE_WRITE);
+  fs::File f = SPIFFS.open(WIFI_CFG_FILE, FILE_WRITE);
   if (!f) return false;
   JsonDocument doc;
   doc["ssid"] = ssid;
@@ -284,7 +287,7 @@ String saveFotoSD(camera_fb_t* fb, int fingerId, const String& tanggal, const St
   jamClean.replace(":", "");
   String path = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
 
-  File f = SD.open(path, FILE_WRITE);
+  fs::File f = SD.open(path, FILE_WRITE);
   if (!f) {
     Serial.println("[SD] Gagal buka file untuk tulis");
     return "";
@@ -306,7 +309,7 @@ void appendLogSD(const String& tanggal, int fingerId,
   String logFile = String(SD_LOG_DIR) + "/" + tanggal + ".csv";
   bool fileExist = SD.exists(logFile);
 
-  File f = SD.open(logFile, FILE_APPEND);
+  fs::File f = SD.open(logFile, FILE_APPEND);
   if (!f) return;
 
   // Header CSV sesuai struktur Laravel
@@ -330,24 +333,24 @@ String readLogToday() {
   String result = "[";
   if (!sdOk || !SD.exists(logFile)) return "[]";
 
-  File f = SD.open(logFile, FILE_READ);
+  fs::File f = SD.open(logFile, FILE_READ);
   if (!f) return "[]";
 
-  bool firstLine = true;
+  bool firstLine  = true;
   bool firstEntry = true;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
-    if (firstLine) { firstLine = false; continue; } // skip header CSV
+    if (firstLine) { firstLine = false; continue; }
     if (line.isEmpty()) continue;
 
-    // Parse CSV: tanggal,jam,finger_id,nama,kelas,status,foto
-    int idx[7];
-    int col = 0;
-    int prev = 0;
-    String fields[7];
-    for (int i = 0; i <= line.length() && col < 7; i++) {
-      if (i == line.length() || line[i] == ',') {
+    // CSV baru 8 kolom:
+    // 0=attendance_date, 1=tapped_at, 2=fingerprint_device_id,
+    // 3=name, 4=nisn, 5=class_name, 6=status, 7=foto
+    String fields[8];
+    int col = 0, prev = 0;
+    for (int i = 0; i <= (int)line.length() && col < 8; i++) {
+      if (i == (int)line.length() || line[i] == ',') {
         fields[col++] = line.substring(prev, i);
         prev = i + 1;
       }
@@ -356,19 +359,25 @@ String readLogToday() {
     if (!firstEntry) result += ",";
     firstEntry = false;
 
-    String fotoUrl = "";
-    if (fields[6].length() > 0) {
-      fotoUrl = "/foto?path=" + fields[6];
-    }
+    // Convert status enum ke label Indonesia
+    String statusLabel = fields[6];
+    if      (statusLabel == "present")    statusLabel = "HADIR";
+    else if (statusLabel == "sick")       statusLabel = "SAKIT";
+    else if (statusLabel == "permission") statusLabel = "IZIN";
+    else if (statusLabel == "absent")     statusLabel = "ALPHA";
+
+    String fotoUrl = fields[7].length() > 0 ? "/foto?path=" + fields[7] : "";
 
     result += "{";
-    result += "\"tanggal\":\""  + fields[0] + "\",";
-    result += "\"jam\":\""      + fields[1] + "\",";
-    result += "\"finger_id\":" + fields[2]  + ",";
-    result += "\"nama\":\""     + fields[3] + "\",";
-    result += "\"kelas\":\""    + fields[4] + "\",";
-    result += "\"status\":\""   + fields[5] + "\",";
-    result += "\"foto_url\":\"" + fotoUrl   + "\"";
+    result += "\"attendance_date\":\"" + fields[0] + "\",";
+    result += "\"tapped_at\":\"" + fields[1] + "\",";
+    result += "\"fingerprint_device_id\":" + fields[2] + ",";
+    result += "\"name\":\"" + fields[3] + "\",";
+    result += "\"nisn\":\"" + fields[4] + "\",";
+    result += "\"class_name\":\"" + fields[5] + "\",";
+    result += "\"status\":\"" + fields[6] + "\",";
+    result += "\"status_label\":\"" + statusLabel + "\",";
+    result += "\"foto_url\":\"" + fotoUrl + "\"";
     result += "}";
   }
   f.close();
@@ -381,18 +390,18 @@ String readLogToday() {
 // ============================================================
 String readStudents() {
   if (!SPIFFS.exists(STUDENTS_FILE)) {
-    File f = SPIFFS.open(STUDENTS_FILE, FILE_WRITE);
+    fs::File f = SPIFFS.open(STUDENTS_FILE, FILE_WRITE);
     f.print("{\"students\":[]}");
     f.close();
   }
-  File f = SPIFFS.open(STUDENTS_FILE, FILE_READ);
+  fs::File f = SPIFFS.open(STUDENTS_FILE, FILE_READ);
   String s = f.readString();
   f.close();
   return s;
 }
 
 bool writeStudents(const String& json) {
-  File f = SPIFFS.open(STUDENTS_FILE, FILE_WRITE);
+  fs::File f = SPIFFS.open(STUDENTS_FILE, FILE_WRITE);
   if (!f) return false;
   f.print(json);
   f.close();
@@ -565,7 +574,7 @@ String ambilFotoDanSimpan(int fingerId, const String& tanggal, const String& jam
   // Simpan ke SD
   String jamClean = jam; jamClean.replace(":", "");
   String path = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
-  File f = SD.open(path, FILE_WRITE);
+  fs::File f = SD.open(path, FILE_WRITE);
   if (f) {
     f.write(jpg_buf, jpg_len);
     f.close();
@@ -757,6 +766,13 @@ void handleHome() {
   body += "</div>";
 
   // Status hardware
+  // Tombol reset log hari ini
+  body += "<div class='card' style='padding:12px 18px'>";
+  body += "<span style='font-size:13px;color:#666'>Log hari ini: <b>" + getTanggal() + "</b></span> &nbsp;";
+  body += "<a href='/reset-log' class='btn br' style='padding:5px 12px;font-size:12px' ";
+  body += "onclick='return confirm(\"Hapus semua log hari ini?\")'> 🗑️ Reset Log Hari Ini</a>";
+  body += "</div>";
+
   body += "<div class='card'><h2>⚙️ Status Hardware</h2><table>";
   body += "<tr><td>📷 Kamera</td><td>" + String(camOk ? "<span class='ok'>✅ OK</span>" : "<span class='err'>❌ Gagal</span>") + "</td></tr>";
   body += "<tr><td>👆 Fingerprint</td><td>" + String(fpOk ? "<span class='ok'>✅ OK</span>" : "<span class='err'>❌ Gagal</span>") + "</td></tr>";
@@ -893,45 +909,56 @@ void handleEnrollPoll() {
   }
 
   if (enroll.step == 1) {
+    // Pastikan loop absensi tidak ganggu
+    sysMode = MODE_ENROLLMENT;
+
     int p = finger.getImage();
     if (p == FINGERPRINT_OK) {
       p = finger.image2Tz(1);
       if (p == FINGERPRINT_OK) {
         enroll.step = 2;
         enroll.statusMsg = "✅ Scan 1 OK! Angkat jari, lalu tempel lagi...";
+        // Tunggu jari diangkat
+        delay(500);
+        while (finger.getImage() != FINGERPRINT_NOFINGER) delay(100);
       } else {
         enroll.statusMsg = "❌ Kualitas buruk, coba lagi...";
       }
     }
   } else if (enroll.step == 2) {
-    if (finger.getImage() == FINGERPRINT_NOFINGER) {
-      // Tunggu jari diangkat, lalu scan kedua
+    // Pastikan loop absensi tidak ganggu
+    sysMode = MODE_ENROLLMENT;
+
+    int p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) {
       enroll.statusMsg = "👆 Tempelkan jari KEDUA (konfirmasi)...";
-    } else {
-      int p = finger.getImage();
+    } else if (p == FINGERPRINT_OK) {
+      // Jari sudah ditempel — proses scan kedua
+      p = finger.image2Tz(2);
       if (p == FINGERPRINT_OK) {
-        p = finger.image2Tz(2);
+        p = finger.createModel();
         if (p == FINGERPRINT_OK) {
-          p = finger.createModel();
+          p = finger.storeModel(enroll.id);
           if (p == FINGERPRINT_OK) {
-            p = finger.storeModel(enroll.id);
-            if (p == FINGERPRINT_OK) {
-              addSiswa(enroll.id, enroll.name, enroll.nisn, enroll.className);
-              enroll.active = false;
-              sysMode = MODE_ABSENSI;
-              resp["done"] = true; resp["success"] = true;
-              resp["message"] = "✅ Enrollment berhasil! " + enroll.name + " terdaftar.";
-              ledBlink(3, 150);
-            } else {
-              enroll.active = false; sysMode = MODE_ABSENSI;
-              resp["done"] = true;
-              resp["message"] = "❌ Gagal simpan ke sensor (error " + String(p) + ")";
-            }
+            addSiswa(enroll.id, enroll.name, enroll.nisn, enroll.className);
+            enroll.active = false;
+            sysMode = MODE_ABSENSI;
+            resp["done"] = true; resp["success"] = true;
+            resp["message"] = "✅ Enrollment berhasil! " + enroll.name + " terdaftar.";
+            ledBlink(3, 150);
           } else {
-            enroll.step = 1;
-            enroll.statusMsg = "❌ Scan tidak cocok, ulangi dari scan pertama...";
+            enroll.active = false; sysMode = MODE_ABSENSI;
+            resp["done"] = true;
+            resp["message"] = "❌ Gagal simpan ke sensor (error " + String(p) + ")";
           }
+        } else {
+          // Model tidak cocok — ulangi dari awal
+          enroll.step = 1;
+          enroll.statusMsg = "❌ Scan tidak cocok, ulangi dari scan pertama...";
+          while (finger.getImage() != FINGERPRINT_NOFINGER) delay(100);
         }
+      } else {
+        enroll.statusMsg = "❌ Kualitas buruk, coba lagi...";
       }
     }
   }
@@ -959,15 +986,18 @@ void handleSiswa() {
   if (cnt == 0) {
     body += "<p style='color:#999;padding:20px 0'>Belum ada siswa terdaftar.</p>";
   } else {
-    body += "<table><tr><th>ID</th><th>Nama</th><th>Kelas</th><th>Aksi</th></tr>";
+    body += "<table><tr><th>ID Finger</th><th>Nama</th><th>NISN</th><th>Kelas/JKK</th><th>Aksi</th></tr>";
     for (JsonObject s : arr) {
-      int    id   = s["id"].as<int>();
-      String nama = s["nama"].as<String>();
-      String kls  = s["kelas"].as<String>();
-      body += "<tr><td><span class='chip'>" + String(id) + "</span></td>";
-      body += "<td>" + nama + "</td><td>" + kls + "</td>";
-      body += "<td><a href='/hapus?id=" + String(id) + "' class='btn br' style='padding:5px 10px;font-size:12px' ";
-      body += "onclick='return confirm(\"Hapus " + nama + "?\")'>🗑️</a></td></tr>";
+      int    fid  = s["fingerprint_device_id"].as<int>();
+      String name = s["name"].as<String>();
+      String nisn = s["nisn"].as<String>();
+      String cls  = s["class_name"].as<String>();
+      body += "<tr><td><span class='chip'>" + String(fid) + "</span></td>";
+      body += "<td>" + name + "</td>";
+      body += "<td>" + nisn + "</td>";
+      body += "<td>" + cls  + "</td>";
+      body += "<td><a href='/hapus?id=" + String(fid) + "' class='btn br' style='padding:5px 10px;font-size:12px' ";
+      body += "onclick='return confirm(\"Hapus " + name + "?\")'> 🗑️</a></td></tr>";
     }
     body += "</table>";
   }
@@ -993,10 +1023,10 @@ void handleLog() {
     body += "<p class='err'>❌ SD Card tidak tersedia</p>";
   } else {
     body += "<p style='margin-bottom:12px'>File log tersimpan di SD Card <code>/log/</code></p>";
-    File dir = SD.open(SD_LOG_DIR);
+    fs::File dir = SD.open(SD_LOG_DIR);
     if (dir) {
       body += "<table><tr><th>Tanggal</th><th>File</th><th>Aksi</th></tr>";
-      File f = dir.openNextFile();
+      fs::File f = dir.openNextFile();
       while (f) {
         String fname = String(f.name());
         String tanggal = fname;
@@ -1025,7 +1055,7 @@ void handleLogView() {
   if (!sdOk || !SD.exists(logFile)) {
     body += "<p class='err'>File tidak ditemukan</p>";
   } else {
-    File f = SD.open(logFile, FILE_READ);
+    fs::File f = SD.open(logFile, FILE_READ);
     if (f) {
       body += "<div class='grid'>";
       bool first = true;
@@ -1094,7 +1124,7 @@ void handleFoto() {
     server.send(404, "text/plain", "File not found");
     return;
   }
-  File f = SD.open(path, FILE_READ);
+  fs::File f = SD.open(path, FILE_READ);
   if (!f) {
     server.send(500, "text/plain", "Open failed");
     return;
@@ -1124,6 +1154,52 @@ void handleApi() {
   resp += "\"data\":" + logJson;
   resp += "}";
   server.send(200, "application/json", resp);
+}
+
+// ============================================================
+//   ROUTE: RESET LOG HARI INI
+// ============================================================
+void handleResetLog() {
+  if (sdOk) {
+    String logFile = String(SD_LOG_DIR) + "/" + getTanggal() + ".csv";
+    if (SD.exists(logFile)) {
+      SD.remove(logFile);
+      Serial.println("[RESET] Log hari ini dihapus: " + logFile);
+    }
+  }
+  totalHadir = 0;
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+// ============================================================
+//   ROUTE: DEBUG — lihat isi SPIFFS langsung
+// ============================================================
+void handleDebug() {
+  String raw = readStudents();
+  Serial.println("[DEBUG] SPIFFS students.json:");
+  Serial.println(raw);
+
+  String body = "<div class='card'><h2>🔍 Debug SPIFFS</h2>";
+  body += "<h3>students.json raw:</h3>";
+  body += "<pre style='background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto'>";
+  body += raw;
+  body += "</pre>";
+
+  // Parse dan tampilkan
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, raw);
+  if (err) {
+    body += "<p style='color:red'>❌ JSON parse error: " + String(err.c_str()) + "</p>";
+  } else {
+    int cnt = 0;
+    for (JsonObject s : doc["students"].as<JsonArray>()) cnt++;
+    body += "<p>✅ JSON valid | Jumlah siswa: <b>" + String(cnt) + "</b></p>";
+  }
+
+  body += "<br><a href='/siswa' class='btn bb'>← Kembali</a>";
+  body += "</div>";
+  server.send(200, "text/html", pageWrap("Debug", "siswa", body));
 }
 
 // ============================================================
@@ -1311,16 +1387,24 @@ void handleOtaUpload() {
     Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
     otaUploaded = 0;
 
-    // ⚠️ Unmount SD Card dulu — cegah timeout conflict saat OTA
-    if (sdOk) {
-      SD.end();
-      Serial.println("[OTA] SD Card di-unmount sementara");
-    }
+    // Bebaskan RAM semaksimal mungkin sebelum OTA
+    if (sdOk)  { SD.end();  Serial.println("[OTA] SD unmount"); }
+    if (camOk) { esp_camera_deinit(); Serial.println("[OTA] Kamera deinit"); }
 
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+    // Cek free heap sebelum mulai
+    Serial.printf("[OTA] Free heap: %d bytes\n", ESP.getFreeHeap());
+
+    // Hitung ukuran partisi OTA yang tersedia
+    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+    size_t ota_size = update_partition ? update_partition->size : UPDATE_SIZE_UNKNOWN;
+    Serial.printf("[OTA] Partisi tersedia: %d bytes\n", ota_size);
+
+    if (!Update.begin(ota_size)) {
       Update.printError(Serial);
-      // Remount SD jika OTA gagal start
+      // Remount
+      SPI.begin(14, 2, 15, 13);
       if (sdOk) SD.begin(SD_CS_PIN);
+      camOk = initCamera();
       return;
     }
     Serial.println("[OTA] Update dimulai...");
@@ -1331,9 +1415,8 @@ void handleOtaUpload() {
       Update.printError(Serial);
       return;
     }
-    // Print progress tiap 50KB biar tidak spam serial
     if (otaUploaded % 51200 < upload.currentSize) {
-      Serial.printf("[OTA] %d KB diterima...\n", otaUploaded / 1024);
+      Serial.printf("[OTA] %d KB...\n", otaUploaded / 1024);
     }
   }
   else if (upload.status == UPLOAD_FILE_END) {
@@ -1344,21 +1427,17 @@ void handleOtaUpload() {
       ESP.restart();
     } else {
       Update.printError(Serial);
-      // Remount SD jika OTA gagal
-      if (sdOk) {
-        SD.begin(SD_CS_PIN);
-        Serial.println("[OTA] SD Card di-remount");
-      }
+      SPI.begin(14, 2, 15, 13);
+      if (sdOk) SD.begin(SD_CS_PIN);
+      camOk = initCamera();
       server.send(500, "text/plain", "OTA gagal! Coba lagi.");
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
-    // Remount SD jika OTA dibatalkan
-    if (sdOk) {
-      SD.begin(SD_CS_PIN);
-      Serial.println("[OTA] Dibatalkan — SD Card di-remount");
-    }
+    SPI.begin(14, 2, 15, 13);
+    if (sdOk) SD.begin(SD_CS_PIN);
+    camOk = initCamera();
     Serial.println("[OTA] Upload dibatalkan!");
   }
 }
@@ -1459,8 +1538,7 @@ void handleCamPage() {
 //   SETUP
 // ============================================================
 void setup() {
-  //Serial.begin(115200);
-  Serial.begin(115200, SERIAL_8N1, -1, 1);
+  Serial.begin(115200);
   Serial.println("\n===================================");
   Serial.println("  SISTEM ABSENSI PURE ESP32-CAM");
   Serial.println("===================================");
@@ -1507,6 +1585,8 @@ void setup() {
   server.on("/foto",         handleFoto);
   server.on("/api",          handleApi);
   server.on("/setting",      handleSetting);
+  server.on("/debug",        handleDebug);
+  server.on("/reset-log",    handleResetLog);
   server.on("/wifi-config",  handleWifiConfig);
   server.on("/wifi-save",    handleWifiSave);
   server.on("/wifi-scan",    handleWifiScan);
