@@ -20,10 +20,14 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
-#include <SD_MMC.h>
+#include <SD.h>
+#include <SPI.h>
 #include <Adafruit_Fingerprint.h>
 #include <Update.h>
 #include <Wire.h>
+#include "esp_vfs_fat.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "config.h"
@@ -201,23 +205,71 @@ void ledBlink(int n, int ms = 200) {
 //   SD CARD — 1-BIT MODE (hanya butuh GPIO 2)
 // ============================================================
 bool initSD() {
-  // SD_MMC 1-bit mode: CLK=GPIO14, CMD/MOSI=GPIO15, DATA0=GPIO2
-  // Tapi konflik dengan FP di GPIO14/15
-  // Gunakan SD_MMC dengan mode 1-bit: hanya DATA0 = GPIO2
-  if (!SD_MMC.begin("/sdcard", true)) {  // true = 1-bit mode
-    Serial.println("[SD] Gagal mount!");
-    return false;
+  // SPI mode — lebih stabil dengan WiFi AP+STA
+  // Pin SPI ESP32-CAM: SCK=14, MISO=2, MOSI=15, CS=13
+  SPI.begin(14, 2, 15, 13);
+
+  // Coba mount dulu
+  if (!SD.begin(13)) {
+    Serial.println("[SD] Gagal mount! Coba format FAT32...");
+
+    // Format otomatis pakai esp_vfs_fat
+    // Lepas SPI dulu, coba via SD_MMC untuk format
+    SD.end();
+
+    // Pakai ff_mkfs dari fatfs untuk format
+    FATFS fs;
+    FRESULT res;
+    const char* path = "/sdcard";
+
+    // Mount paksa untuk format
+    esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
+      .format_if_mount_failed = true,  // ← auto format jika gagal!
+      .max_files = 5,
+      .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_card_t* card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = HSPI_HOST;
+
+    sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_cfg.gpio_cs   = (gpio_num_t)13;
+    slot_cfg.host_id   = (spi_host_device_t)host.slot;
+
+    esp_err_t err = esp_vfs_fat_sdspi_mount(path, &host, &slot_cfg, &mount_cfg, &card);
+    if (err == ESP_OK) {
+      Serial.println("[SD] Format & mount berhasil!");
+      esp_vfs_fat_sdcard_unmount(path, card);
+      // Remount via Arduino SD library
+      SPI.begin(14, 2, 15, 13);
+      if (!SD.begin(13)) {
+        Serial.println("[SD] Remount gagal setelah format");
+        return false;
+      }
+    } else {
+      Serial.printf("[SD] Format gagal: 0x%x\n", err);
+      Serial.println("[SD] Kemungkinan: SD tidak terpasang / rusak");
+      return false;
+    }
   }
-  uint8_t cardType = SD_MMC.cardType();
+
+  uint8_t cardType = SD.cardType();
   if (cardType == CARD_NONE) {
     Serial.println("[SD] Tidak ada SD Card!");
     return false;
   }
-  Serial.printf("[SD] OK! Size: %llu MB\n", SD_MMC.cardSize() / (1024*1024));
 
-  // Buat folder jika belum ada
-  if (!SD_MMC.exists(SD_FOTO_DIR)) SD_MMC.mkdir(SD_FOTO_DIR);
-  if (!SD_MMC.exists(SD_LOG_DIR))  SD_MMC.mkdir(SD_LOG_DIR);
+  // Info SD Card
+  String typeStr = "UNKNOWN";
+  if      (cardType == CARD_MMC)  typeStr = "MMC";
+  else if (cardType == CARD_SD)   typeStr = "SD";
+  else if (cardType == CARD_SDHC) typeStr = "SDHC";
+  Serial.printf("[SD] Type: %s | Size: %llu MB\n",
+    typeStr.c_str(), SD.cardSize() / (1024*1024));
+
+  if (!SD.exists(SD_FOTO_DIR)) SD.mkdir(SD_FOTO_DIR);
+  if (!SD.exists(SD_LOG_DIR))  SD.mkdir(SD_LOG_DIR);
   return true;
 }
 
@@ -231,7 +283,7 @@ String saveFotoSD(camera_fb_t* fb, int fingerId, const String& tanggal, const St
   jamClean.replace(":", "");
   String path = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
 
-  File f = SD_MMC.open(path, FILE_WRITE);
+  File f = SD.open(path, FILE_WRITE);
   if (!f) {
     Serial.println("[SD] Gagal buka file untuk tulis");
     return "";
@@ -251,9 +303,9 @@ void appendLogSD(const String& tanggal, int fingerId,
                  const String& fotoPath) {
   if (!sdOk) return;
   String logFile = String(SD_LOG_DIR) + "/" + tanggal + ".csv";
-  bool fileExist = SD_MMC.exists(logFile);
+  bool fileExist = SD.exists(logFile);
 
-  File f = SD_MMC.open(logFile, FILE_APPEND);
+  File f = SD.open(logFile, FILE_APPEND);
   if (!f) return;
 
   if (!fileExist) {
@@ -273,9 +325,9 @@ String readLogToday() {
   String logFile = String(SD_LOG_DIR) + "/" + tanggal + ".csv";
 
   String result = "[";
-  if (!sdOk || !SD_MMC.exists(logFile)) return "[]";
+  if (!sdOk || !SD.exists(logFile)) return "[]";
 
-  File f = SD_MMC.open(logFile, FILE_READ);
+  File f = SD.open(logFile, FILE_READ);
   if (!f) return "[]";
 
   bool firstLine = true;
@@ -499,7 +551,7 @@ String ambilFotoDanSimpan(int fingerId, const String& tanggal, const String& jam
   // Simpan ke SD
   String jamClean = jam; jamClean.replace(":", "");
   String path = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
-  File f = SD_MMC.open(path, FILE_WRITE);
+  File f = SD.open(path, FILE_WRITE);
   if (f) {
     f.write(jpg_buf, jpg_len);
     f.close();
@@ -909,7 +961,7 @@ void handleLog() {
     body += "<p class='err'>❌ SD Card tidak tersedia</p>";
   } else {
     body += "<p style='margin-bottom:12px'>File log tersimpan di SD Card <code>/log/</code></p>";
-    File dir = SD_MMC.open(SD_LOG_DIR);
+    File dir = SD.open(SD_LOG_DIR);
     if (dir) {
       body += "<table><tr><th>Tanggal</th><th>File</th><th>Aksi</th></tr>";
       File f = dir.openNextFile();
@@ -938,10 +990,10 @@ void handleLogView() {
   String body = "<div class='card'><h2>📋 Log: " + tanggal + "</h2>";
   body += "<a href='/log' class='btn bgy' style='padding:6px 12px;font-size:13px;margin-bottom:12px'>← Kembali</a><br><br>";
 
-  if (!sdOk || !SD_MMC.exists(logFile)) {
+  if (!sdOk || !SD.exists(logFile)) {
     body += "<p class='err'>File tidak ditemukan</p>";
   } else {
-    File f = SD_MMC.open(logFile, FILE_READ);
+    File f = SD.open(logFile, FILE_READ);
     if (f) {
       body += "<div class='grid'>";
       bool first = true;
@@ -987,11 +1039,11 @@ void handleFoto() {
     server.send(404, "text/plain", "Not found");
     return;
   }
-  if (!SD_MMC.exists(path)) {
+  if (!SD.exists(path)) {
     server.send(404, "text/plain", "File not found");
     return;
   }
-  File f = SD_MMC.open(path, FILE_READ);
+  File f = SD.open(path, FILE_READ);
   if (!f) {
     server.send(500, "text/plain", "Open failed");
     return;
@@ -1209,14 +1261,14 @@ void handleOtaUpload() {
 
     // ⚠️ Unmount SD Card dulu — cegah timeout conflict saat OTA
     if (sdOk) {
-      SD_MMC.end();
+      SD.end();
       Serial.println("[OTA] SD Card di-unmount sementara");
     }
 
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
       // Remount SD jika OTA gagal start
-      if (sdOk) SD_MMC.begin("/sdcard", true);
+      if (sdOk) SD.begin(SD_CS_PIN);
       return;
     }
     Serial.println("[OTA] Update dimulai...");
@@ -1242,7 +1294,7 @@ void handleOtaUpload() {
       Update.printError(Serial);
       // Remount SD jika OTA gagal
       if (sdOk) {
-        SD_MMC.begin("/sdcard", true);
+        SD.begin(SD_CS_PIN);
         Serial.println("[OTA] SD Card di-remount");
       }
       server.send(500, "text/plain", "OTA gagal! Coba lagi.");
@@ -1252,7 +1304,7 @@ void handleOtaUpload() {
     Update.abort();
     // Remount SD jika OTA dibatalkan
     if (sdOk) {
-      SD_MMC.begin("/sdcard", true);
+      SD.begin(SD_CS_PIN);
       Serial.println("[OTA] Dibatalkan — SD Card di-remount");
     }
     Serial.println("[OTA] Upload dibatalkan!");
