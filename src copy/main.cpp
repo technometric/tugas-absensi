@@ -23,9 +23,7 @@
 #include <SD_MMC.h>
 #include <Adafruit_Fingerprint.h>
 #include <Update.h>
-#include <Wire.h>
 #include "esp_camera.h"
-#include "img_converters.h"
 #include "config.h"
 
 #define FW_VERSION     "1.0.0"
@@ -414,8 +412,6 @@ int countSiswa() {
 // ============================================================
 bool initCamera() {
   camera_config_t cfg;
-  memset(&cfg, 0, sizeof(cfg));
-
   cfg.ledc_channel = LEDC_CHANNEL_0;
   cfg.ledc_timer   = LEDC_TIMER_0;
   cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
@@ -430,82 +426,27 @@ bool initCamera() {
   cfg.pin_sccb_scl = SIOC_GPIO_NUM;
   cfg.pin_pwdn     = PWDN_GPIO_NUM;
   cfg.pin_reset    = RESET_GPIO_NUM;
-  cfg.xclk_freq_hz = 10000000;          // 10MHz — lebih stabil (dari kode kamu)
-  cfg.pixel_format = PIXFORMAT_RGB565;  // RGB565 → convert ke JPEG (dari kode kamu)
-  cfg.frame_size   = FRAMESIZE_QQVGA;  // 160x120 default, bisa diubah
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = CAM_FRAMESIZE;
+  cfg.jpeg_quality = CAM_QUALITY;
   cfg.fb_count     = 1;
-  cfg.fb_location  = CAMERA_FB_IN_DRAM;
-  cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) { Serial.printf("[CAM] Gagal: 0x%x\n", err); return false; }
-
-  // Verifikasi sensor
-  sensor_t* s = esp_camera_sensor_get();
-  if (!s) { Serial.println("[CAM] Sensor get GAGAL!"); return false; }
-  Serial.printf("[CAM] Sensor PID: 0x%x\n", s->id.PID);
-  s->set_framesize(s, FRAMESIZE_QQVGA);
-  delay(300);
-
-  // Test frame + convert JPEG
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { Serial.println("[CAM] Frame test GAGAL!"); return false; }
-  Serial.printf("[CAM] Frame OK: %d bytes, format: %d\n", fb->len, fb->format);
-  uint8_t* jpg_buf = NULL; size_t jpg_len = 0;
-  bool conv = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-  if (!conv || !jpg_buf) { Serial.println("[CAM] JPEG convert GAGAL!"); if(jpg_buf) free(jpg_buf); return false; }
-  Serial.printf("[CAM] JPEG convert OK: %d bytes\n", jpg_len);
-  free(jpg_buf);
-
-  Serial.println("[CAM] Siap!");
+  Serial.println("[CAM] OK");
   return true;
 }
 
-// Ambil foto — convert RGB565 -> JPEG, return fb (caller harus fb_return!)
-// CATATAN: fb->buf berisi JPEG hasil convert, bukan raw RGB565
 camera_fb_t* ambilFoto() {
   delay(PHOTO_DELAY);
+  // Nyalakan flash sebentar
   digitalWrite(LED_FLASH_PIN, HIGH);
   delay(100);
   camera_fb_t* fb = esp_camera_fb_get();
   digitalWrite(LED_FLASH_PIN, LOW);
-  if (!fb) { Serial.println("[CAM] Gagal capture"); return nullptr; }
-  Serial.printf("[CAM] Frame: %d bytes\n", fb->len);
-  return fb;  // caller convert ke JPEG saat simpan
-}
-
-// Convert frame RGB565 ke JPEG dan simpan ke SD
-// Return: path file atau ""
-String ambilFotoDanSimpan(int fingerId, const String& tanggal, const String& jam) {
-  camera_fb_t* fb = ambilFoto();
-  if (!fb) return "";
-
-  uint8_t* jpg_buf = NULL;
-  size_t   jpg_len = 0;
-  bool conv = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-
-  if (!conv || !jpg_buf) {
-    Serial.println("[CAM] Convert JPEG gagal");
-    if (jpg_buf) free(jpg_buf);
-    return "";
-  }
-
-  // Simpan ke SD
-  String jamClean = jam; jamClean.replace(":", "");
-  String path = String(SD_FOTO_DIR) + "/" + tanggal + "_" + jamClean + "_id" + fingerId + ".jpg";
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (f) {
-    f.write(jpg_buf, jpg_len);
-    f.close();
-    Serial.printf("[CAM] Foto simpan: %s (%d bytes)\n", path.c_str(), jpg_len);
-  } else {
-    Serial.println("[CAM] Gagal buka file SD");
-    path = "";
-  }
-  free(jpg_buf);
-  return path;
+  if (!fb) Serial.println("[CAM] Gagal capture");
+  else Serial.printf("[CAM] Foto: %d bytes\n", fb->len);
+  return fb;
 }
 
 // ============================================================
@@ -567,8 +508,15 @@ void prosesAbsensi(int fingerId) {
   Serial.printf("[ABSEN] ID:%d | %s | %s | %s\n",
     fingerId, info.nama.c_str(), status.c_str(), jam.c_str());
 
-  // Ambil foto + convert RGB565->JPEG + simpan ke SD
-  String fotoPath = ambilFotoDanSimpan(fingerId, tanggal, jam);
+  // Ambil foto
+  camera_fb_t* fb = ambilFoto();
+
+  // Simpan foto ke SD
+  String fotoPath = "";
+  if (fb) {
+    fotoPath = saveFotoSD(fb, fingerId, tanggal, jam);
+    esp_camera_fb_return(fb);
+  }
 
   // Append log ke SD
   appendLogSD(tanggal, fingerId, info.nama, info.kelas, status, jam, fotoPath);
@@ -644,7 +592,6 @@ String pageWrap(const String& title, const String& active, const String& body) {
   h += "<a href='/enroll' class='" + String(active=="enroll"?"active":"") + "'>➕ Daftar</a>";
   h += "<a href='/siswa' class='" + String(active=="siswa"?"active":"") + "'>👥 Siswa</a>";
   h += "<a href='/log' class='" + String(active=="log"?"active":"") + "'>📋 Log</a>";
-  h += "<a href='/cam' class='" + String(active=="cam"?"active":"") + "'>📷 Kamera</a>";
   h += "<a href='/setting' class='" + String(active=="setting"?"active":"") + "'>⚙️ Setting</a>";
   h += "</div><div class='wrap'>" + body + "</div>";
   h += "<script>";
@@ -1108,9 +1055,9 @@ void handleWifiScan() {
   for (int i = 0; i < n; i++) {
     if (i > 0) resp += ",";
     String enc = WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "Open" : "WPA/WPA2";
-    resp += "{\"ssid\":\"" + WiFi.SSID(i) + "\",";
-    resp += "\"rssi\":"   + String(WiFi.RSSI(i)) + ",";
-    resp += "\"enc\":\""  + enc + "\"}";
+    resp += "{\"ssid\":\"\" + WiFi.SSID(i) + \"\",";
+    resp += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    resp += "\"enc\":\"" + enc + "\"\"}";
   }
   resp += "]}";
   server.send(200, "application/json", resp);
@@ -1269,60 +1216,6 @@ void handleSetting() {
 }
 
 // ============================================================
-//   STREAM KAMERA (MJPEG via WebServer)
-// ============================================================
-void handleStream() {
-  WiFiClient client = server.client();
-
-  // Header multipart MJPEG
-  String header =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  client.print(header);
-
-  Serial.println("[STREAM] Client konek");
-
-  while (client.connected()) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { delay(30); continue; }
-
-    uint8_t* jpg_buf = NULL;
-    size_t   jpg_len = 0;
-    bool conv = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-    esp_camera_fb_return(fb);
-
-    if (!conv || !jpg_buf) {
-      if (jpg_buf) free(jpg_buf);
-      delay(30);
-      continue;
-    }
-
-    // Kirim frame MJPEG
-    String part =
-      "--frame\r\n"
-      "Content-Type: image/jpeg\r\n"
-      "Content-Length: " + String(jpg_len) + "\r\n\r\n";
-    client.print(part);
-    client.write(jpg_buf, jpg_len);
-    client.print("\r\n");
-
-    free(jpg_buf);
-    delay(50);  // ~20fps max
-  }
-  Serial.println("[STREAM] Client disconnect");
-}
-
-void handleCamPage() {
-  String ip = wifiOk ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-  String body = "<div class='card'><h2>📷 Live Camera Stream</h2>";
-  body += "<p>Stream URL: <code>http://" + ip + "/stream</code></p>";
-  body += "<img src='/stream' style='width:100%;max-width:640px;border-radius:8px;border:2px solid #1a73e8'>";
-  body += "<br><br><small style='color:#999'>Format: MJPEG | Resolusi: QQVGA 160x120 | ~20fps</small>";
-  body += "</div>";
-  server.send(200, "text/html", pageWrap("Camera", "cam", body));
-}
-
-// ============================================================
 //   SETUP
 // ============================================================
 void setup() {
@@ -1380,8 +1273,6 @@ void setup() {
     []() { server.send(200, "text/plain", "OK"); },
     handleOtaUpload
   );
-  server.on("/stream",       handleStream);
-  server.on("/cam",          handleCamPage);
   server.begin();
 
   Serial.println("[WEB] Server ready!");
