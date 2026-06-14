@@ -549,44 +549,6 @@ String ambilFotoDanSimpan(int fingerId, const String& tanggal, const String& jam
 }
 
 // ============================================================
-//   UPLOAD FOTO KE VPS
-// ============================================================
-String uploadFotoVPS(const uint8_t* jpg_buf, size_t jpg_len,
-                     int fingerId, const String& nama,
-                     const String& tanggal, const String& jam) {
-  if (!VPS_ENABLED || !wifiOk || !jpg_buf) return "";
-
-  HTTPClient http;
-  String url = String(VPS_HOST) + VPS_UPLOAD_PATH;
-
-  http.begin(url);
-  http.addHeader("Content-Type",    "image/jpeg");
-  http.addHeader("X-Secret-Key",    VPS_SECRET_KEY);
-  http.addHeader("X-Finger-ID",     String(fingerId));
-  http.addHeader("X-Nama",          nama);
-  http.addHeader("X-Tanggal",       tanggal);
-  http.addHeader("X-Jam",           jam);
-
-  int code = http.POST((uint8_t*)jpg_buf, jpg_len);
-  Serial.printf("[VPS] Upload response: %d\n", code);
-
-  String fotoUrl = "";
-  if (code == 200) {
-    String resp = http.getString();
-    // Parse JSON response: {"ok":true,"url":"https://..."}
-    JsonDocument doc;
-    if (!deserializeJson(doc, resp)) {
-      fotoUrl = doc["url"].as<String>();
-      Serial.printf("[VPS] URL: %s\n", fotoUrl.c_str());
-    }
-  } else {
-    Serial.printf("[VPS] Gagal upload: %d\n", code);
-  }
-  http.end();
-  return fotoUrl;
-}
-
-// ============================================================
 //   FINGERPRINT
 // ============================================================
 bool initFingerprint() {
@@ -671,10 +633,6 @@ void prosesAbsensi(int fingerId) {
       fs::File f = SD.open(fotoPath, FILE_WRITE);
       if (f) { f.write(jpg_buf, jpg_len); f.close(); }
       else fotoPath = "";
-
-      // Upload ke VPS (jika enabled)
-      fotoUrl = uploadFotoVPS(jpg_buf, jpg_len, fingerId,
-                              info.name, tanggal, jam);
       free(jpg_buf);
     }
   }
