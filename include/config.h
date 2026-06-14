@@ -72,3 +72,9 @@
 
 // --- Web Server ---
 #define HTTP_PORT       80
+
+#define FW_VERSION "1.5.3"
+
+#define GITHUB_OWNER "technometric"
+#define GITHUB_REPO  "ufim-absensi"
+#define OTA_BIN_NAME "firmware.bin"

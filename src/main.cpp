@@ -15,6 +15,8 @@
  */
 
 #include <Arduino.h>
+#include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
 // Blynk — wajib include setelah define TEMPLATE_ID di config.h
 #include "config.h"  // BLYNK_TEMPLATE_ID, BLYNK_TEMPLATE_NAME, BLYNK_AUTH_TOKEN
 #define BLYNK_PRINT Serial
@@ -33,9 +35,8 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 // config.h sudah diinclude di atas
-
-#define FW_VERSION     "1.5.1"
 #define WIFI_CFG_FILE  "/wifi.json"
+
 
 // ============================================================
 //   PIN KAMERA (AI Thinker ESP32-CAM)
@@ -102,6 +103,14 @@ bool camOk       = false;
 bool wifiOk      = false;
 bool apMode      = false;
 
+// ===== OTA STATE =====
+volatile int otaPercent = 0;
+volatile bool otaRunning = false;
+volatile bool otaDone = false;
+String otaStatus = "Idle";
+String latestTag = "";
+String latestBinUrl = "";
+String latestNotes = "";
 
 // ============================================================
 //   WIFI CONFIG — BACA/TULIS SSID+PASS DI SPIFFS
@@ -1291,12 +1300,228 @@ void handleWifiScan() {
   server.send(200, "application/json", resp);
 }
 
+
+// ============================================================
+//   OTA GITHUB RELEASE
+// ============================================================
+String jsonEscape(const String &in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "";
+    else out += c;
+  }
+  return out;
+}
+
+int versionCompare(String a, String b) {
+  a.replace("v", "");
+  a.replace("V", "");
+  b.replace("v", "");
+  b.replace("V", "");
+
+  int av[3] = {0, 0, 0};
+  int bv[3] = {0, 0, 0};
+
+  sscanf(a.c_str(), "%d.%d.%d", &av[0], &av[1], &av[2]);
+  sscanf(b.c_str(), "%d.%d.%d", &bv[0], &bv[1], &bv[2]);
+
+  for (int i = 0; i < 3; i++) {
+    if (av[i] > bv[i]) return 1;
+    if (av[i] < bv[i]) return -1;
+  }
+  return 0;
+}
+
+bool checkGithubRelease(String &msg) {
+  if (WiFi.status() != WL_CONNECTED) {
+    msg = "WiFi belum konek ke router";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String apiUrl = "https://api.github.com/repos/" + String(GITHUB_OWNER) + "/" + String(GITHUB_REPO) + "/releases/latest";
+
+  otaStatus = "Menghubungi GitHub...";
+  http.begin(client, apiUrl);
+  http.addHeader("User-Agent", "ufim-absensi-esp32");
+  http.addHeader("Accept", "application/vnd.github+json");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    msg = "GitHub API gagal. HTTP " + String(code);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    msg = "JSON GitHub gagal dibaca";
+    return false;
+  }
+
+  latestTag = doc["tag_name"].as<String>();
+  latestNotes = doc["body"].as<String>();
+  latestBinUrl = "";
+
+  JsonArray assets = doc["assets"].as<JsonArray>();
+  for (JsonObject asset : assets) {
+    String name = asset["name"].as<String>();
+    if (name == OTA_BIN_NAME || name.endsWith(".bin")) {
+      latestBinUrl = asset["browser_download_url"].as<String>();
+      break;
+    }
+  }
+
+  if (latestTag.length() == 0) {
+    msg = "Tag release tidak ditemukan";
+    return false;
+  }
+
+  if (latestBinUrl.length() == 0) {
+    msg = "Asset firmware .bin tidak ditemukan di release " + latestTag;
+    return false;
+  }
+
+  if (versionCompare(latestTag, FW_VERSION) <= 0) {
+    msg = "Firmware sudah terbaru. Current v" FW_VERSION ", Latest " + latestTag;
+    return false;
+  }
+
+  msg = "Update tersedia: " + latestTag;
+  return true;
+}
+
+void otaTask(void *param) {
+  otaRunning = true;
+  otaDone = false;
+  otaPercent = 0;
+  otaStatus = "Cek release terbaru...";
+
+  String msg;
+  if (!checkGithubRelease(msg)) {
+    otaStatus = msg;
+    otaRunning = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  otaStatus = "Download firmware " + latestTag + "...";
+  otaPercent = 1;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  httpUpdate.rebootOnUpdate(false);
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  httpUpdate.onStart([]() {
+    otaStatus = "Mulai update firmware...";
+    otaPercent = 2;
+    Serial.println("[OTA] Start");
+  });
+
+  httpUpdate.onProgress([](int cur, int total) {
+    if (total > 0) {
+      otaPercent = (cur * 100) / total;
+      if (otaPercent < 2) otaPercent = 2;
+      if (otaPercent > 99) otaPercent = 99;
+    }
+    otaStatus = "Downloading " + String(otaPercent) + "%";
+    Serial.printf("[OTA] %d%% (%d/%d)\n", otaPercent, cur, total);
+  });
+
+  httpUpdate.onEnd([]() {
+    otaPercent = 100;
+    otaDone = true;
+    otaStatus = "Update selesai. Restart...";
+    Serial.println("[OTA] End");
+  });
+
+  httpUpdate.onError([](int err) {
+    otaStatus = "OTA error " + String(err) + ": " + httpUpdate.getLastErrorString();
+    Serial.printf("[OTA] Error %d: %s\n", err, httpUpdate.getLastErrorString().c_str());
+  });
+
+  Serial.println("[OTA] URL: " + latestBinUrl);
+  t_httpUpdate_return ret = httpUpdate.update(client, latestBinUrl);
+
+  if (ret == HTTP_UPDATE_OK) {
+    otaPercent = 100;
+    otaStatus = "Update OK. Restart dalam 2 detik...";
+    otaRunning = false;
+    delay(2000);
+    ESP.restart();
+  } else if (ret == HTTP_UPDATE_NO_UPDATES) {
+    otaStatus = "Tidak ada update";
+    otaRunning = false;
+  } else {
+    otaStatus = "Update gagal: " + httpUpdate.getLastErrorString();
+    Serial.printf(
+      "[OTA] FAILED (%d): %s\n",
+      httpUpdate.getLastError(),
+      httpUpdate.getLastErrorString().c_str()
+    );
+    otaRunning = false;
+  }
+
+  vTaskDelete(NULL);
+}
+
+void handleOtaStart() {
+  if (otaRunning) {
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"OTA sedang berjalan\"}");
+    return;
+  }
+
+  otaPercent = 0;
+  otaDone = false;
+  otaStatus = "Menyiapkan OTA...";
+
+  xTaskCreatePinnedToCore(
+    otaTask,
+    "otaTask",
+    12288,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"OTA dimulai\"}");
+}
+
+void handleOtaProgress() {
+  String json = "{";
+  json += "\"version\":\"v" FW_VERSION "\",";
+  json += "\"latest\":\"" + jsonEscape(latestTag) + "\",";
+  json += "\"percent\":" + String(otaPercent) + ",";
+  json += "\"running\":" + String(otaRunning ? "true" : "false") + ",";
+  json += "\"done\":" + String(otaDone ? "true" : "false") + ",";
+  json += "\"status\":\"" + jsonEscape(otaStatus) + "\",";
+  json += "\"notes\":\"" + jsonEscape(latestNotes) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 // ============================================================
 //   ROUTE: HALAMAN PENGATURAN (Hub)
 // ============================================================
 void handleSetting() {
   String body = "<div class='card'><h2>⚙️ Pengaturan Sistem</h2>";
-  body += "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px'>";
+  body += "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px'>";
 
   // WiFi Card
   body += "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px'>";
@@ -1306,7 +1531,19 @@ void handleSetting() {
   body += "<a href='/wifi-config' class='btn bb'>Buka Pengaturan</a>";
   body += "</div>";
 
-
+  // OTA Card
+  body += "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px'>";
+  body += "<div style='font-size:28px;margin-bottom:8px'>⬆️</div>";
+  body += "<h3 style='margin-bottom:6px'>Update Firmware OTA</h3>";
+  body += "<p style='color:#666;font-size:13px;margin-bottom:12px'>Update dari GitHub Release: technometric/ufim-absensi</p>";
+  body += "<p style='font-size:13px'><b>Versi saat ini:</b> v" FW_VERSION "</p>";
+  body += "<button class='btn bg' onclick='startOta()'>Update Firmware</button>";
+  body += "<div style='width:100%;height:22px;background:#eee;border-radius:20px;overflow:hidden;margin-top:12px'>";
+  body += "<div id='otaBar' style='width:0%;height:100%;background:#34a853;color:white;text-align:center;font-size:12px;line-height:22px'>0%</div>";
+  body += "</div>";
+  body += "<div id='otaStatus' style='font-size:13px;color:#555;margin-top:8px'>Idle</div>";
+  body += "<pre id='otaNotes' style='white-space:pre-wrap;background:#f5f5f5;padding:10px;border-radius:8px;margin-top:8px;max-height:120px;overflow:auto;font-size:12px'></pre>";
+  body += "</div>";
 
   // Info Card
   body += "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px'>";
@@ -1320,6 +1557,15 @@ void handleSetting() {
   body += "</table></div>";
 
   body += "</div></div>";
+
+  body += "<script>";
+  body += "let otaTimer=null;";
+  body += "function setOta(p,s,n){document.getElementById('otaBar').style.width=p+'%';document.getElementById('otaBar').textContent=p+'%';document.getElementById('otaStatus').textContent=s||'';if(n){document.getElementById('otaNotes').textContent=n;}}";
+  body += "function pollOta(){fetch('/ota-progress').then(r=>r.json()).then(j=>{setOta(j.percent,j.status,j.notes);if(!j.running&&j.percent>=100){clearInterval(otaTimer);setTimeout(()=>location.reload(),5000);}else if(!j.running&&j.percent<100&&j.status!='Idle'){clearInterval(otaTimer);}}).catch(e=>{});}";
+  body += "function startOta(){if(!confirm('Update firmware dari GitHub sekarang?'))return;setOta(0,'Menyiapkan OTA...','');fetch('/ota-start').then(r=>r.json()).then(j=>{document.getElementById('otaStatus').textContent=j.msg;if(otaTimer)clearInterval(otaTimer);otaTimer=setInterval(pollOta,800);pollOta();});}";
+  body += "pollOta();";
+  body += "</script>";
+
   server.send(200, "text/html", pageWrap("Pengaturan", "setting", body));
 }
 
@@ -1428,6 +1674,8 @@ void setup() {
   server.on("/foto",         handleFoto);
   server.on("/api",          handleApi);
   server.on("/setting",      handleSetting);
+  server.on("/ota-start",    handleOtaStart);
+  server.on("/ota-progress", handleOtaProgress);
   server.on("/debug",        handleDebug);
   server.on("/reset-log",    handleResetLog);
   server.on("/wifi-config",  handleWifiConfig);
