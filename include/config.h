@@ -16,6 +16,10 @@
 #define BLYNK_VPIN_STATUS   V2
 #define BLYNK_VPIN_JAM      V3
 #define BLYNK_VPIN_TOTAL    V4
+#define BLYNK_VPIN_SISA     V8
+#define BLYNK_VPIN_RASIO    V7
+#define BLYNK_VPIN_PERSEN   V6
+#define BLYNK_VPIN_FOTO     V5
 
 // --- Pin AS608 Fingerprint ---
 // UART1 ESP32-CAM — pin aman yang tidak konflik kamera
@@ -73,7 +77,7 @@
 // --- Web Server ---
 #define HTTP_PORT       80
 
-#define FW_VERSION "1.5.3"
+#define FW_VERSION "1.5.5"
 
 #define GITHUB_OWNER "technometric"
 #define GITHUB_REPO  "ufim-absensi"

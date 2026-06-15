@@ -103,6 +103,10 @@ bool camOk       = false;
 bool wifiOk      = false;
 bool apMode      = false;
 
+// Dashboard realtime: popup absensi terbaru di browser
+volatile uint32_t lastAbsensiSeq = 0;
+String lastAbsensiJson = "{}";
+
 // ===== OTA STATE =====
 volatile int otaPercent = 0;
 volatile bool otaRunning = false;
@@ -111,6 +115,9 @@ String otaStatus = "Idle";
 String latestTag = "";
 String latestBinUrl = "";
 String latestNotes = "";
+
+String jsonEscape(const String &in);
+
 
 // ============================================================
 //   WIFI CONFIG — BACA/TULIS SSID+PASS DI SPIFFS
@@ -458,6 +465,75 @@ int countSiswa() {
   return c;
 }
 
+
+struct AttendanceStats {
+  int totalSiswa;
+  int hadir;
+  int sisa;
+  int ditolak;
+  int record;
+  int persen;
+};
+
+AttendanceStats getAttendanceStatsToday() {
+  AttendanceStats st;
+  st.totalSiswa = countSiswa();
+  st.hadir = 0;
+  st.sisa = st.totalSiswa;
+  st.ditolak = 0;
+  st.record = 0;
+  st.persen = 0;
+
+  bool counted[128] = {false};
+  String logJson = readLogToday();
+
+  if (logJson != "[]") {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, logJson);
+    if (!err) {
+      for (JsonObject r : doc.as<JsonArray>()) {
+        st.record++;
+        String status = r["status"].as<String>();
+        int fid = r["fingerprint_device_id"].as<int>();
+
+        if (status == "present" || status == "sick" || status == "permission") {
+          if (fid >= 1 && fid <= 127 && !counted[fid]) {
+            counted[fid] = true;
+            st.hadir++;
+          }
+        } else {
+          st.ditolak++;
+        }
+      }
+    }
+  }
+
+  if (st.totalSiswa > 0) {
+    st.sisa = st.totalSiswa - st.hadir;
+    if (st.sisa < 0) st.sisa = 0;
+    st.persen = (st.hadir * 100) / st.totalSiswa;
+  }
+
+  return st;
+}
+
+void updateLastAbsensiPopup(const String& nama, int fingerId,
+                            const String& statusLabel, const String& jam,
+                            const String& kelas, const String& nisn,
+                            const String& fotoUrl) {
+  lastAbsensiSeq++;
+  lastAbsensiJson = "{";
+  lastAbsensiJson += "\"seq\":" + String(lastAbsensiSeq) + ",";
+  lastAbsensiJson += "\"name\":\"" + jsonEscape(nama) + "\",";
+  lastAbsensiJson += "\"fingerprint_device_id\":" + String(fingerId) + ",";
+  lastAbsensiJson += "\"status_label\":\"" + jsonEscape(statusLabel) + "\",";
+  lastAbsensiJson += "\"tapped_at\":\"" + jsonEscape(jam) + "\",";
+  lastAbsensiJson += "\"class_name\":\"" + jsonEscape(kelas) + "\",";
+  lastAbsensiJson += "\"nisn\":\"" + jsonEscape(nisn) + "\",";
+  lastAbsensiJson += "\"foto_url\":\"" + jsonEscape(fotoUrl) + "\"";
+  lastAbsensiJson += "}";
+}
+
 // ============================================================
 //   KAMERA
 // ============================================================
@@ -593,20 +669,30 @@ void kirimBlynk(const String& nama, int id,
     return;
   }
 
-  // Sesuai datastream Blynk:
-  // V0 = Nama_Siswa      (String)
-  // V1 = ID_Fingerprint  (Integer 1-30)
-  // V2 = Status          (String)
-  // V3 = Jam_Absensi     (String)
-  // V4 = Total_Hadir     (Integer 0-30)
+  AttendanceStats st = getAttendanceStatsToday();
+  String rasio = String(st.hadir) + "/" + String(st.totalSiswa) + " (" + String(st.persen) + "%)";
+
+  // Datastream Blynk:
+  // V0 = Nama_Siswa        (String)
+  // V1 = ID_Fingerprint    (Integer)
+  // V2 = Status            (String)
+  // V3 = Jam_Absensi       (String)
+  // V4 = Hadir_Hari_Ini    (Integer)
+  // V5 = Foto_URL          (String, dikirim di prosesAbsensi jika ada)
+  // V6 = Persen_Hadir      (Integer 0-100)
+  // V7 = Rasio_Hadir       (String, contoh: 16/20 (80%))
+  // V8 = Sisa_Belum_Hadir  (Integer)
   Blynk.virtualWrite(V0, nama);
   Blynk.virtualWrite(V1, id);
   Blynk.virtualWrite(V2, status);
   Blynk.virtualWrite(V3, jam);
-  Blynk.virtualWrite(V4, totalHadir);
+  Blynk.virtualWrite(V4, st.hadir);
+  Blynk.virtualWrite(V6, st.persen);
+  Blynk.virtualWrite(V7, rasio);
+  Blynk.virtualWrite(V8, st.sisa);
 
-  Serial.printf("[BLYNK] Terkirim: %s | ID:%d | %s | %s | Total:%d\n",
-    nama.c_str(), id, status.c_str(), jam.c_str(), totalHadir);
+  Serial.printf("[BLYNK] %s | ID:%d | %s | %s | Hadir:%d/%d (%d%%) | Sisa:%d\n",
+    nama.c_str(), id, status.c_str(), jam.c_str(), st.hadir, st.totalSiswa, st.persen, st.sisa);
 }
 
 // ============================================================
@@ -649,6 +735,13 @@ void prosesAbsensi(int fingerId) {
   // Append log ke SD
   appendLogSD(tanggal, fingerId, info.name, info.nisn,
               info.className, status, jam, fotoPath);
+
+  if (fotoPath.length() > 0) {
+    fotoUrl = "/foto?path=" + fotoPath;
+  }
+
+  updateLastAbsensiPopup(info.name, fingerId, statusLabel, jam,
+                         info.className, info.nisn, fotoUrl);
 
   // Blynk notifikasi
   if (info.found) {
@@ -743,27 +836,22 @@ String pageWrap(const String& title, const String& active, const String& body) {
 // ============================================================
 void handleHome() {
   String logJson = readLogToday();
-
-  // Hitung stats dari log
-  int totalRec = 0, totalHadirToday = 0, totalTolak = 0;
-  if (logJson != "[]") {
-    JsonDocument doc;
-    deserializeJson(doc, logJson);
-    for (JsonObject r : doc.as<JsonArray>()) {
-      totalRec++;
-      String st = String(r["status"].as<const char*>());
-      if (st == "present") totalHadirToday++;
-      // sick & permission juga dihitung kehadiran (tidak alpha)
-      else totalTolak++;
-    }
-  }
+  AttendanceStats st = getAttendanceStatsToday();
+  String rasio = String(st.hadir) + "/" + String(st.totalSiswa);
 
   String body = "<div class='stats'>";
-  body += "<div class='stat'><div class='n'>" + String(totalHadirToday) + "</div><div class='l'>✅ Hadir Hari Ini</div></div>";
-  body += "<div class='stat'><div class='n'>" + String(totalRec) + "</div><div class='l'>📋 Total Record</div></div>";
-  body += "<div class='stat'><div class='n'>" + String(totalTolak) + "</div><div class='l'>❌ Ditolak</div></div>";
-  body += "<div class='stat'><div class='n'>" + String(countSiswa()) + "</div><div class='l'>👥 Siswa Terdaftar</div></div>";
+  body += "<div class='stat'><div class='n' id='statRasio'>" + rasio + "</div><div class='l'>✅ Rasio Hadir Hari Ini</div></div>";
+  body += "<div class='stat'><div class='n' id='statPersen'>" + String(st.persen) + "%</div><div class='l'>📊 Persentase Kehadiran</div></div>";
+  body += "<div class='stat'><div class='n' id='statSisa'>" + String(st.sisa) + "</div><div class='l'>⏳ Belum Hadir</div></div>";
+  body += "<div class='stat'><div class='n' id='statTolak'>" + String(st.ditolak) + "</div><div class='l'>❌ Ditolak/Tidak Dikenal</div></div>";
   body += "</div>";
+
+  body += "<div class='card'><h2>📊 Persentase Absensi Hari Ini</h2>";
+  body += "<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:8px'>";
+  body += "<span><b id='barRasio'>" + rasio + "</b> siswa sudah absen</span><span><b id='barPersenText'>" + String(st.persen) + "%</b></span></div>";
+  body += "<div style='height:20px;background:#e5e7eb;border-radius:20px;overflow:hidden'>";
+  body += "<div id='barPersen' style='height:100%;width:" + String(st.persen) + "%;background:#34a853;border-radius:20px;text-align:center;color:white;font-size:12px;line-height:20px'>" + String(st.persen) + "%</div>";
+  body += "</div><p style='font-size:12px;color:#666;margin-top:8px'>Sisa belum absen: <b id='barSisa'>" + String(st.sisa) + "</b> siswa dari total <b id='barTotal'>" + String(st.totalSiswa) + "</b>.</p></div>";
 
   // Status hardware
   // Tombol reset log hari ini
@@ -787,13 +875,42 @@ void handleHome() {
   body += "<script>";
   body += "var data=" + logJson + ";";
   body += "var el=document.getElementById('cards');";
-  body += "if(!data||data.length===0){el.innerHTML='<p style=\"color:#999;padding:20px\">📭 Belum ada absensi hari ini</p>';}";
-  body += "else{el.innerHTML='';data.reverse().forEach(function(d){";
-  body += "var foto=d.foto_url?'<img src=\"'+d.foto_url+'\" onerror=\"this.outerHTML=\\'<div class=avi>👤</div>\\'\">':`<div class='avi'>👤</div>`;";
+  body += "function escHtml(v){return String(v==null?'':v).replace(/[&<>\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;'}[c]||c;});}";
+  body += "function renderCards(arr){if(!el)return;if(!arr||arr.length===0){el.innerHTML='<p style=\"color:#999;padding:20px\">📭 Belum ada absensi hari ini</p>';return;}el.innerHTML='';arr.slice().reverse().forEach(function(d){";
+  body += "var foto=d.foto_url?'<img src=\"'+escHtml(d.foto_url)+'\" onerror=\"this.outerHTML=\\'<div class=avi>👤</div>\\'\">':'<div class=avi>👤</div>';";
   body += "var bc=d.status_label==='HADIR'?'bh':(d.status_label==='SAKIT'?'bh':d.status_label==='IZIN'?'bh':'bd');";
-  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+d.name+'</div><div class=kl>'+d.class_name+'</div><span class=\"badge '+bc+'\">'+d.status_label+'</span><div class=jm>🕐 '+d.tapped_at+'</div><div class=fid>ID: '+d.fingerprint_device_id+'</div></div>';";
+  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+escHtml(d.name)+'</div><div class=kl>'+escHtml(d.class_name)+'</div><span class=\"badge '+bc+'\">'+escHtml(d.status_label)+'</span><div class=jm>🕐 '+escHtml(d.tapped_at)+'</div><div class=fid>ID: '+escHtml(d.fingerprint_device_id)+'</div></div>';";
   body += "});}";
+  body += "function setText(id,v){var x=document.getElementById(id);if(x)x.textContent=v;}";
+  body += "function renderStats(j){if(!j)return;setText('statRasio',j.rasio||'0/0');setText('statPersen',(j.persen_hadir||0)+'%');setText('statSisa',j.total_sisa||0);setText('statTolak',j.total_tolak||0);setText('barRasio',j.rasio||'0/0');setText('barPersenText',(j.persen_hadir||0)+'%');setText('barSisa',j.total_sisa||0);setText('barTotal',j.total_siswa||0);var b=document.getElementById('barPersen');if(b){b.style.width=(j.persen_hadir||0)+'%';b.textContent=(j.persen_hadir||0)+'%';}}";
+  body += "renderCards(data);";
   body += "</script></div>";
+
+  body += "<div id='absenPopup' style='display:none;position:fixed;z-index:9999;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:18px'>";
+  body += "<div style='background:white;border-radius:18px;max-width:380px;width:100%;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.25);text-align:center;position:relative'>";
+  body += "<button onclick='closeAbsenPopup()' style='position:absolute;right:12px;top:10px;border:0;background:#eee;border-radius:50%;width:28px;height:28px;font-weight:bold'>×</button>";
+  body += "<h2 style='margin:6px 0 12px'>✅ Absensi Berhasil</h2>";
+  body += "<div id='popFoto'><div style='width:160px;height:120px;margin:auto;border-radius:12px;background:#eee;display:flex;align-items:center;justify-content:center;font-size:50px'>👤</div></div>";
+  body += "<h3 id='popNama' style='margin:12px 0 4px'>-</h3>";
+  body += "<p id='popInfo' style='color:#666;font-size:14px;margin-bottom:8px'>-</p>";
+  body += "<span id='popStatus' class='badge bh'>HADIR</span>";
+  body += "<p id='popJam' style='margin-top:10px;color:#555'>-</p>";
+  body += "</div></div>";
+  body += "<script>";
+  body += "var SEEN_KEY='ufim_absensi_seen_seq';var lastSeq=parseInt(localStorage.getItem(SEEN_KEY)||'0')||0;";
+  body += "function closeAbsenPopup(){document.getElementById('absenPopup').style.display='none'}";
+  body += "function showAbsenPopup(d){if(!d||!d.seq||d.seq<=lastSeq)return;lastSeq=d.seq;localStorage.setItem(SEEN_KEY,String(lastSeq));";
+  body += "document.getElementById('popNama').textContent=d.name||'-';";
+  body += "document.getElementById('popInfo').textContent='ID '+d.fingerprint_device_id+' • '+(d.class_name||'-')+' • NISN '+(d.nisn||'-');";
+  body += "document.getElementById('popStatus').textContent=d.status_label||'-';";
+  body += "document.getElementById('popStatus').className='badge '+((d.status_label==='HADIR')?'bh':'bd');";
+  body += "document.getElementById('popJam').textContent='Jam: '+(d.tapped_at||'-');";
+  body += "var empty='<div style=\"width:160px;height:120px;margin:auto;border-radius:12px;background:#eee;display:flex;align-items:center;justify-content:center;font-size:50px\">👤</div>';";
+  body += "document.getElementById('popFoto').innerHTML=d.foto_url?'<img src=\"'+d.foto_url+'&t='+Date.now()+'\" style=\"width:180px;height:135px;object-fit:cover;border-radius:12px;border:2px solid #34a853\" onerror=\"this.outerHTML=\\\''+empty+'\\\'\">':empty;";
+  body += "document.getElementById('absenPopup').style.display='flex';setTimeout(closeAbsenPopup,8000)}";
+  body += "function refreshDashboard(){fetch('/api?ts='+Date.now()).then(r=>r.json()).then(j=>{renderStats(j);renderCards(j.data);if(j.latest_absensi)showAbsenPopup(j.latest_absensi);}).catch(e=>{});}";
+  body += "setInterval(refreshDashboard,1500);";
+  body += "</script>";
 
   server.send(200, "text/html", pageWrap("Dashboard", "home", body));
 }
@@ -1138,19 +1255,18 @@ void handleFoto() {
 // ============================================================
 void handleApi() {
   String logJson = readLogToday();
-  int totalHadirToday = 0, totalTolak = 0;
-  JsonDocument doc;
-  deserializeJson(doc, logJson);
-  for (JsonObject r : doc.as<JsonArray>()) {
-    String st = String(r["status"].as<const char*>());
-    if (st == "present" || st == "sick" || st == "permission") totalHadirToday++;
-    else totalTolak++;
-  }
+  AttendanceStats st = getAttendanceStatsToday();
+
   String resp = "{";
-  resp += "\"total_hadir\":" + String(totalHadirToday) + ",";
-  resp += "\"total_siswa\":" + String(countSiswa()) + ",";
-  resp += "\"total_tolak\":" + String(totalTolak) + ",";
+  resp += "\"total_hadir\":" + String(st.hadir) + ",";
+  resp += "\"total_siswa\":" + String(st.totalSiswa) + ",";
+  resp += "\"total_sisa\":" + String(st.sisa) + ",";
+  resp += "\"persen_hadir\":" + String(st.persen) + ",";
+  resp += "\"total_tolak\":" + String(st.ditolak) + ",";
+  resp += "\"total_record\":" + String(st.record) + ",";
+  resp += "\"rasio\":\"" + String(st.hadir) + "/" + String(st.totalSiswa) + "\",";
   resp += "\"sd_ok\":" + String(sdOk ? "true" : "false") + ",";
+  resp += "\"latest_absensi\":" + lastAbsensiJson + ",";
   resp += "\"data\":" + logJson;
   resp += "}";
   server.send(200, "application/json", resp);
