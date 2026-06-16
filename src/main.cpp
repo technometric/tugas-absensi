@@ -106,6 +106,7 @@ bool apMode      = false;
 // Dashboard realtime: popup absensi terbaru di browser
 volatile uint32_t lastAbsensiSeq = 0;
 String lastAbsensiJson = "{}";
+String popupBootId = "";
 
 // ===== OTA STATE =====
 volatile int otaPercent = 0;
@@ -385,10 +386,10 @@ bool writeStudents(const String& json) {
   return true;
 }
 
-struct SiswaInfo { String name; String nisn; String className; bool found; };
+struct SiswaInfo { String name; String nisn; String className; String fotoUrl; bool found; };
 
 SiswaInfo getSiswaById(int id) {
-  SiswaInfo info = {"Unknown", "-", "-", false};
+  SiswaInfo info = {"Unknown", "-", "-", "", false};
   JsonDocument doc;
   deserializeJson(doc, readStudents());
   for (JsonObject s : doc["students"].as<JsonArray>()) {
@@ -396,6 +397,7 @@ SiswaInfo getSiswaById(int id) {
       info.name      = s["name"].as<String>();
       info.nisn      = s["nisn"].as<String>();
       info.className = s["class_name"].as<String>();
+      info.fotoUrl   = s["foto_url"] | "";
       info.found     = true;
       return info;
     }
@@ -403,7 +405,7 @@ SiswaInfo getSiswaById(int id) {
   return info;
 }
 
-bool addSiswa(int fingerId, const String& name, const String& nisn, const String& className) {
+bool addSiswa(int fingerId, const String& name, const String& nisn, const String& className, const String& fotoUrl = "") {
   JsonDocument doc;
   deserializeJson(doc, readStudents());
   JsonArray arr = doc["students"].as<JsonArray>();
@@ -413,6 +415,7 @@ bool addSiswa(int fingerId, const String& name, const String& nisn, const String
       s["name"]       = name;
       s["nisn"]       = nisn;
       s["class_name"] = className;
+      if (fotoUrl.length() > 0) s["foto_url"] = fotoUrl;
       String out; serializeJson(doc, out);
       return writeStudents(out);
     }
@@ -423,6 +426,7 @@ bool addSiswa(int fingerId, const String& name, const String& nisn, const String
   ns["name"]       = name;
   ns["nisn"]       = nisn;
   ns["class_name"] = className;
+  ns["foto_url"] = fotoUrl;
   String out; serializeJson(doc, out);
   return writeStudents(out);
 }
@@ -738,6 +742,9 @@ void prosesAbsensi(int fingerId) {
 
   if (fotoPath.length() > 0) {
     fotoUrl = "/foto?path=" + fotoPath;
+    if (info.found) addSiswa(fingerId, info.name, info.nisn, info.className, fotoUrl);
+  } else if (info.fotoUrl.length() > 0) {
+    fotoUrl = info.fotoUrl;
   }
 
   updateLastAbsensiPopup(info.name, fingerId, statusLabel, jam,
@@ -873,17 +880,16 @@ void handleHome() {
   body += "<div class='card'><h2>📋 Absensi Hari Ini</h2>";
   body += "<div class='grid' id='cards'>⏳ Memuat...</div>";
   body += "<script>";
-  body += "var data=" + logJson + ";";
-  body += "var el=document.getElementById('cards');";
-  body += "function escHtml(v){return String(v==null?'':v).replace(/[&<>\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;'}[c]||c;});}";
-  body += "function renderCards(arr){if(!el)return;if(!arr||arr.length===0){el.innerHTML='<p style=\"color:#999;padding:20px\">📭 Belum ada absensi hari ini</p>';return;}el.innerHTML='';arr.slice().reverse().forEach(function(d){";
-  body += "var foto=d.foto_url?'<img src=\"'+escHtml(d.foto_url)+'\" onerror=\"this.outerHTML=\\'<div class=avi>👤</div>\\'\">':'<div class=avi>👤</div>';";
-  body += "var bc=d.status_label==='HADIR'?'bh':(d.status_label==='SAKIT'?'bh':d.status_label==='IZIN'?'bh':'bd');";
-  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+escHtml(d.name)+'</div><div class=kl>'+escHtml(d.class_name)+'</div><span class=\"badge '+bc+'\">'+escHtml(d.status_label)+'</span><div class=jm>🕐 '+escHtml(d.tapped_at)+'</div><div class=fid>ID: '+escHtml(d.fingerprint_device_id)+'</div></div>';";
-  body += "});}";
-  body += "function setText(id,v){var x=document.getElementById(id);if(x)x.textContent=v;}";
+  body += "function setText(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}";
   body += "function renderStats(j){if(!j)return;setText('statRasio',j.rasio||'0/0');setText('statPersen',(j.persen_hadir||0)+'%');setText('statSisa',j.total_sisa||0);setText('statTolak',j.total_tolak||0);setText('barRasio',j.rasio||'0/0');setText('barPersenText',(j.persen_hadir||0)+'%');setText('barSisa',j.total_sisa||0);setText('barTotal',j.total_siswa||0);var b=document.getElementById('barPersen');if(b){b.style.width=(j.persen_hadir||0)+'%';b.textContent=(j.persen_hadir||0)+'%';}}";
-  body += "renderCards(data);";
+  body += "function renderCards(data){var el=document.getElementById('cards');if(!el)return;";
+  body += "if(!data||data.length===0){el.innerHTML='<p style=\"color:#999;padding:20px\">📭 Belum ada absensi hari ini</p>';return;}";
+  body += "el.innerHTML='';data.slice().reverse().forEach(function(d){";
+  body += "var foto=d.foto_url?'<img src=\"'+d.foto_url+'\" onerror=\"this.outerHTML=\\\'<div class=avi>👤</div>\\\'\">':'<div class=\"avi\">👤</div>';";
+  body += "var bc=(d.status_label==='HADIR'||d.status_label==='SAKIT'||d.status_label==='IZIN')?'bh':'bd';";
+  body += "el.innerHTML+='<div class=scard>'+foto+'<div class=nm>'+d.name+'</div><div class=kl>'+d.class_name+'</div><span class=\"badge '+bc+'\">'+d.status_label+'</span><div class=jm>🕐 '+d.tapped_at+'</div><div class=fid>ID: '+d.fingerprint_device_id+'</div></div>';";
+  body += "});}";
+  body += "renderCards(" + logJson + ");";
   body += "</script></div>";
 
   body += "<div id='absenPopup' style='display:none;position:fixed;z-index:9999;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:18px'>";
@@ -897,19 +903,21 @@ void handleHome() {
   body += "<p id='popJam' style='margin-top:10px;color:#555'>-</p>";
   body += "</div></div>";
   body += "<script>";
-  body += "var SEEN_KEY='ufim_absensi_seen_seq';var lastSeq=parseInt(localStorage.getItem(SEEN_KEY)||'0')||0;";
-  body += "function closeAbsenPopup(){document.getElementById('absenPopup').style.display='none'}";
-  body += "function showAbsenPopup(d){if(!d||!d.seq||d.seq<=lastSeq)return;lastSeq=d.seq;localStorage.setItem(SEEN_KEY,String(lastSeq));";
+  body += "var popState={boot:'',seq:0,ready:false,showing:false,timer:null};";
+  body += "function savePopState(){}";
+  body += "function closeAbsenPopup(){var p=document.getElementById('absenPopup');if(p)p.style.display='none';popState.showing=false;if(popState.timer)clearTimeout(popState.timer);}";
+  body += "function showAbsenPopup(d){if(!d||!d.seq)return;popState.showing=true;if(popState.timer)clearTimeout(popState.timer);";
   body += "document.getElementById('popNama').textContent=d.name||'-';";
   body += "document.getElementById('popInfo').textContent='ID '+d.fingerprint_device_id+' • '+(d.class_name||'-')+' • NISN '+(d.nisn||'-');";
   body += "document.getElementById('popStatus').textContent=d.status_label||'-';";
-  body += "document.getElementById('popStatus').className='badge '+((d.status_label==='HADIR')?'bh':'bd');";
+  body += "document.getElementById('popStatus').className='badge '+((d.status_label==='HADIR'||d.status_label==='SAKIT'||d.status_label==='IZIN')?'bh':'bd');";
   body += "document.getElementById('popJam').textContent='Jam: '+(d.tapped_at||'-');";
   body += "var empty='<div style=\"width:160px;height:120px;margin:auto;border-radius:12px;background:#eee;display:flex;align-items:center;justify-content:center;font-size:50px\">👤</div>';";
-  body += "document.getElementById('popFoto').innerHTML=d.foto_url?'<img src=\"'+d.foto_url+'&t='+Date.now()+'\" style=\"width:180px;height:135px;object-fit:cover;border-radius:12px;border:2px solid #34a853\" onerror=\"this.outerHTML=\\\''+empty+'\\\'\">':empty;";
-  body += "document.getElementById('absenPopup').style.display='flex';setTimeout(closeAbsenPopup,8000)}";
-  body += "function refreshDashboard(){fetch('/api?ts='+Date.now()).then(r=>r.json()).then(j=>{renderStats(j);renderCards(j.data);if(j.latest_absensi)showAbsenPopup(j.latest_absensi);}).catch(e=>{});}";
-  body += "setInterval(refreshDashboard,1500);";
+  body += "var src=d.foto_url?(d.foto_url+(d.foto_url.indexOf('?')>-1?'&':'?')+'t='+Date.now()):'';";
+  body += "document.getElementById('popFoto').innerHTML=src?'<img src=\"'+src+'\" style=\"width:180px;height:135px;object-fit:cover;border-radius:12px;border:2px solid #34a853\" onerror=\"this.outerHTML=\\\''+empty+'\\\'\">':empty;";
+  body += "document.getElementById('absenPopup').style.display='flex';popState.timer=setTimeout(closeAbsenPopup,8000)}";
+  body += "function pollDash(){fetch('/api?ts='+Date.now(),{cache:'no-store'}).then(r=>r.json()).then(j=>{renderStats(j);renderCards(j.data);var d=j.latest_absensi||{};var b=j.popup_boot_id||'';var seq=d&&d.seq?Number(d.seq):0;if(!popState.ready||popState.boot!==b){popState.boot=b;popState.seq=seq;popState.ready=true;return;}if(seq>popState.seq){popState.seq=seq;showAbsenPopup(d);}}).catch(e=>{});}";
+  body += "pollDash();setInterval(pollDash,1200);";
   body += "</script>";
 
   server.send(200, "text/html", pageWrap("Dashboard", "home", body));
@@ -1012,6 +1020,25 @@ void handleEnrollStart() {
   server.send(200, "application/json", out);
 }
 
+
+String captureEnrollPhotoUrl(int fingerId) {
+  if (!camOk || !sdOk) return "";
+  camera_fb_t* fb = ambilFoto();
+  if (!fb) return "";
+  uint8_t* jpg_buf = NULL;
+  size_t jpg_len = 0;
+  bool conv = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+  esp_camera_fb_return(fb);
+  if (!conv || !jpg_buf) return "";
+  String path = String(SD_FOTO_DIR) + "/siswa_id" + String(fingerId) + ".jpg";
+  fs::File f = SD.open(path, FILE_WRITE);
+  if (f) { f.write(jpg_buf, jpg_len); f.close(); }
+  else path = "";
+  free(jpg_buf);
+  if (path.length() == 0) return "";
+  return "/foto?path=" + path;
+}
+
 void handleEnrollPoll() {
   JsonDocument resp;
   resp["done"]    = false;
@@ -1057,7 +1084,8 @@ void handleEnrollPoll() {
         if (p == FINGERPRINT_OK) {
           p = finger.storeModel(enroll.id);
           if (p == FINGERPRINT_OK) {
-            addSiswa(enroll.id, enroll.name, enroll.nisn, enroll.className);
+            String fotoUrl = captureEnrollPhotoUrl(enroll.id);
+            addSiswa(enroll.id, enroll.name, enroll.nisn, enroll.className, fotoUrl);
             enroll.active = false;
             sysMode = MODE_ABSENSI;
             resp["done"] = true; resp["success"] = true;
@@ -1085,6 +1113,38 @@ void handleEnrollPoll() {
   server.send(200, "application/json", out);
 }
 
+
+String latestFotoUrlForSiswa(int fingerId) {
+  if (!sdOk || fingerId <= 0) return "";
+
+  String profilePath = String(SD_FOTO_DIR) + "/siswa_id" + String(fingerId) + ".jpg";
+  if (SD.exists(profilePath)) return "/foto?path=" + profilePath;
+
+  fs::File dir = SD.open(SD_FOTO_DIR);
+  if (!dir || !dir.isDirectory()) return "";
+
+  String needle = "_id" + String(fingerId) + ".jpg";
+  String best = "";
+  time_t bestTime = 0;
+
+  fs::File file = dir.openNextFile();
+  while (file) {
+    String name = String(file.name());
+    if (!file.isDirectory() && name.endsWith(needle)) {
+      time_t t = file.getLastWrite();
+      if (best.length() == 0 || t >= bestTime) {
+        best = name;
+        bestTime = t;
+      }
+    }
+    file = dir.openNextFile();
+  }
+
+  if (best.length() == 0) return "";
+  if (!best.startsWith("/")) best = String(SD_FOTO_DIR) + "/" + best;
+  return "/foto?path=" + best;
+}
+
 // ============================================================
 //   ROUTE: DAFTAR SISWA
 // ============================================================
@@ -1103,13 +1163,20 @@ void handleSiswa() {
   if (cnt == 0) {
     body += "<p style='color:#999;padding:20px 0'>Belum ada siswa terdaftar.</p>";
   } else {
-    body += "<table><tr><th>ID Finger</th><th>Nama</th><th>NISN</th><th>Kelas/JKK</th><th>Aksi</th></tr>";
+    body += "<table><tr><th>Foto</th><th>ID Finger</th><th>Nama</th><th>NISN</th><th>Kelas/JKK</th><th>Aksi</th></tr>";
     for (JsonObject s : arr) {
       int    fid  = s["fingerprint_device_id"].as<int>();
       String name = s["name"].as<String>();
       String nisn = s["nisn"].as<String>();
       String cls  = s["class_name"].as<String>();
-      body += "<tr><td><span class='chip'>" + String(fid) + "</span></td>";
+      String foto = s["foto_url"] | "";
+      if (foto.length() == 0) foto = latestFotoUrlForSiswa(fid);
+      String fotoBust = foto;
+      if (fotoBust.length() > 0) fotoBust += (fotoBust.indexOf('?') >= 0 ? "&" : "?") + String("t=") + String(millis());
+      String fotoHtml = fotoBust.length() > 0
+        ? "<img src='" + fotoBust + "' style='width:64px;height:52px;object-fit:cover;border-radius:8px;border:1px solid #ddd' onerror=\"this.outerHTML='<div class=avi style=\\\"width:64px;height:52px;font-size:22px\\\">👤</div>'\">"
+        : "<div class='avi' style='width:64px;height:52px;font-size:22px'>👤</div>";
+      body += "<tr><td>" + fotoHtml + "</td><td><span class='chip'>" + String(fid) + "</span></td>";
       body += "<td>" + name + "</td>";
       body += "<td>" + nisn + "</td>";
       body += "<td>" + cls  + "</td>";
@@ -1266,6 +1333,7 @@ void handleApi() {
   resp += "\"total_record\":" + String(st.record) + ",";
   resp += "\"rasio\":\"" + String(st.hadir) + "/" + String(st.totalSiswa) + "\",";
   resp += "\"sd_ok\":" + String(sdOk ? "true" : "false") + ",";
+  resp += "\"popup_boot_id\":\"" + jsonEscape(popupBootId) + "\",";
   resp += "\"latest_absensi\":" + lastAbsensiJson + ",";
   resp += "\"data\":" + logJson;
   resp += "}";
@@ -1747,6 +1815,7 @@ void setup() {
   Serial.println("\n===================================");
   Serial.println("  SISTEM ABSENSI PURE ESP32-CAM");
   Serial.println("===================================");
+  popupBootId = String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX) + "-" + String(millis());
 
   pinMode(LED_ONBOARD, OUTPUT);
   digitalWrite(LED_ONBOARD, HIGH);

@@ -77,7 +77,7 @@
 // --- Web Server ---
 #define HTTP_PORT       80
 
-#define FW_VERSION "1.5.5"
+#define FW_VERSION "1.5.6"
 
 #define GITHUB_OWNER "technometric"
 #define GITHUB_REPO  "ufim-absensi"
