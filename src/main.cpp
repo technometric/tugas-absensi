@@ -118,6 +118,7 @@ String latestBinUrl = "";
 String latestNotes = "";
 
 String jsonEscape(const String &in);
+void sendCorsHeaders();
 
 
 // ============================================================
@@ -994,6 +995,7 @@ void handleEnroll() {
 }
 
 void handleEnrollStart() {
+  sendCorsHeaders();
   String name      = server.arg("name");
   String nisn      = server.arg("nisn");
   String className = server.arg("class_name");
@@ -1040,6 +1042,7 @@ String captureEnrollPhotoUrl(int fingerId) {
 }
 
 void handleEnrollPoll() {
+  sendCorsHeaders();
   JsonDocument resp;
   resp["done"]    = false;
   resp["success"] = false;
@@ -1296,9 +1299,24 @@ void handleLogView() {
 
 
 // ============================================================
+//   UTIL: CORS + JSON helper
+// ============================================================
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleOptions() {
+  sendCorsHeaders();
+  server.send(204, "text/plain", "");
+}
+
+// ============================================================
 //   ROUTE: SERVE FOTO DARI SD
 // ============================================================
 void handleFoto() {
+  sendCorsHeaders();
   String path = server.arg("path");
   if (path.isEmpty() || !sdOk) {
     server.send(404, "text/plain", "Not found");
@@ -1321,8 +1339,11 @@ void handleFoto() {
 //   ROUTE: API JSON (untuk polling dashboard)
 // ============================================================
 void handleApi() {
+  sendCorsHeaders();
   String logJson = readLogToday();
   AttendanceStats st = getAttendanceStatsToday();
+
+  String ip = wifiOk ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
 
   String resp = "{";
   resp += "\"total_hadir\":" + String(st.hadir) + ",";
@@ -1333,11 +1354,39 @@ void handleApi() {
   resp += "\"total_record\":" + String(st.record) + ",";
   resp += "\"rasio\":\"" + String(st.hadir) + "/" + String(st.totalSiswa) + "\",";
   resp += "\"sd_ok\":" + String(sdOk ? "true" : "false") + ",";
+  resp += "\"wifi_ok\":" + String(wifiOk ? "true" : "false") + ",";
+  resp += "\"esp32_ip\":\"" + jsonEscape(ip) + "\",";
   resp += "\"popup_boot_id\":\"" + jsonEscape(popupBootId) + "\",";
   resp += "\"latest_absensi\":" + lastAbsensiJson + ",";
   resp += "\"data\":" + logJson;
   resp += "}";
   server.send(200, "application/json", resp);
+}
+
+void handleStatus() {
+  sendCorsHeaders();
+  String ip = wifiOk ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String resp = "{";
+  resp += "\"wifi_ok\":" + String(wifiOk ? "true" : "false") + ",";
+  resp += "\"mode\":\"" + String(wifiOk ? "station" : "access_point") + "\",";
+  resp += "\"esp32_ip\":\"" + jsonEscape(ip) + "\"";
+  resp += "}";
+  server.send(200, "application/json", resp);
+}
+
+void handleStudents() {
+  sendCorsHeaders();
+  JsonDocument doc;
+  deserializeJson(doc, readStudents());
+  JsonArray arr = doc["students"].as<JsonArray>();
+  String out;
+  serializeJson(arr, out);
+  server.send(200, "application/json", out);
+}
+
+void handleNotFound() {
+  sendCorsHeaders();
+  server.send(404, "application/json", "{\"error\":\"Not found\"}");
 }
 
 // ============================================================
@@ -1848,26 +1897,36 @@ void setup() {
 
 
   // Web Server Routes
-  server.on("/",             handleHome);
-  server.on("/enroll",       handleEnroll);
-  server.on("/enroll-start", handleEnrollStart);
-  server.on("/enroll-poll",  handleEnrollPoll);
-  server.on("/siswa",        handleSiswa);
-  server.on("/hapus",        handleHapus);
-  server.on("/log",          handleLog);
-  server.on("/log-view",     handleLogView);
-  server.on("/foto",         handleFoto);
-  server.on("/api",          handleApi);
-  server.on("/setting",      handleSetting);
-  server.on("/ota-start",    handleOtaStart);
-  server.on("/ota-progress", handleOtaProgress);
-  server.on("/debug",        handleDebug);
-  server.on("/reset-log",    handleResetLog);
-  server.on("/wifi-config",  handleWifiConfig);
-  server.on("/wifi-save",    handleWifiSave);
-  server.on("/wifi-scan",    handleWifiScan);
-  server.on("/stream",       handleStream);
-  server.on("/cam",          handleCamPage);
+  server.enableCORS(true);
+  server.on("/",             HTTP_GET, handleHome);
+  server.on("/enroll",       HTTP_GET, handleEnroll);
+  server.on("/siswa",        HTTP_GET, handleSiswa);
+  server.on("/hapus",        HTTP_GET, handleHapus);
+  server.on("/log",          HTTP_GET, handleLog);
+  server.on("/log-view",     HTTP_GET, handleLogView);
+  server.on("/setting",      HTTP_GET, handleSetting);
+  server.on("/ota-start",    HTTP_GET, handleOtaStart);
+  server.on("/ota-progress", HTTP_GET, handleOtaProgress);
+  server.on("/debug",        HTTP_GET, handleDebug);
+  server.on("/reset-log",    HTTP_GET, handleResetLog);
+  server.on("/wifi-config",  HTTP_GET, handleWifiConfig);
+  server.on("/wifi-save",    HTTP_GET, handleWifiSave);
+  server.on("/wifi-scan",    HTTP_GET, handleWifiScan);
+  server.on("/stream",       HTTP_GET, handleStream);
+  server.on("/cam",          HTTP_GET, handleCamPage);
+  server.on("/api",          HTTP_GET, handleApi);
+  server.on("/foto",         HTTP_GET, handleFoto);
+  server.on("/status",       HTTP_GET, handleStatus);
+  server.on("/students",     HTTP_GET, handleStudents);
+  server.on("/enroll-start", HTTP_GET, handleEnrollStart);
+  server.on("/enroll-poll",  HTTP_GET, handleEnrollPoll);
+  server.on("/api",          HTTP_OPTIONS, handleOptions);
+  server.on("/foto",         HTTP_OPTIONS, handleOptions);
+  server.on("/status",       HTTP_OPTIONS, handleOptions);
+  server.on("/students",     HTTP_OPTIONS, handleOptions);
+  server.on("/enroll-start", HTTP_OPTIONS, handleOptions);
+  server.on("/enroll-poll",  HTTP_OPTIONS, handleOptions);
+  server.onNotFound(handleNotFound);
   server.begin();
 
   // Tampilkan semua cara akses

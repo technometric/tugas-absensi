@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard Absensi ESP32-CAM</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="header-row">
+        <div>
+          <h1>Dashboard Absensi ESP32-CAM</h1>
+          <p>Web server berjalan di laptop; ESP32 hanya digunakan untuk enrollment dan foto.</p>
+        </div>
+        <div class="host-box">
+          <label for="esp32-host">IP ESP32</label>
+          <input id="esp32-host" type="text" placeholder="192.168.43.xxx" />
+          <button id="save-host">Simpan</button>
+          <p id="host-help" class="hint">Isi IP ESP32 lalu klik Simpan. Enrollment hanya bekerja jika ESP32 terkoneksi.</p>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-section="dashboard">Dashboard</button>
+      <button class="tab" data-section="attendance">Absensi</button>
+      <button class="tab" data-section="enroll">Enrollment</button>
+      <button class="tab" data-section="students">Data Siswa</button>
+    </nav>
+
+    <main>
+      <section id="dashboard" class="section active">
+        <div class="cards">
+          <article class="card">
+            <h2>ESP32 Status</h2>
+            <p id="esp32-status">Memuat...</p>
+          </article>
+          <article class="card">
+            <h2>Ringkasan Hari Ini</h2>
+            <div class="summary-grid">
+              <div><span id="total-siswa">-</span><small>Total siswa</small></div>
+              <div><span id="total-hadir">-</span><small>Hadir</small></div>
+              <div><span id="total-sisa">-</span><small>Belum hadir</small></div>
+              <div><span id="persen-hadir">-</span><small>Persen hadir</small></div>
+              <div><span id="total-tolak">-</span><small>Ditolak</small></div>
+            </div>
+          </article>
+        </div>
+
+        <section class="latest">
+          <h2>Absensi Terbaru</h2>
+          <div id="latest-card" class="latest-card">
+            <div><strong>Nama:</strong> <span id="latest-name">-</span></div>
+            <div><strong>ID Fingerprint:</strong> <span id="latest-id">-</span></div>
+            <div><strong>Status:</strong> <span id="latest-status">-</span></div>
+            <div><strong>Waktu:</strong> <span id="latest-time">-</span></div>
+            <div><strong>Kelas:</strong> <span id="latest-class">-</span></div>
+            <div><strong>NISN:</strong> <span id="latest-nisn">-</span></div>
+          </div>
+          <div id="latest-photo" class="photo-box">
+            <img id="latest-photo-img" src="" alt="Foto absensi" />
+          </div>
+        </section>
+
+        <section class="history">
+          <h2>Riwayat Absensi Hari Ini</h2>
+          <div class="table-responsive">
+            <table>
+              <thead>
+                <tr>
+                  <th>Jam</th>
+                  <th>Nama</th>
+                  <th>ID</th>
+                  <th>Status</th>
+                  <th>Kelas</th>
+                  <th>Foto</th>
+                </tr>
+              </thead>
+              <tbody id="history-body">
+                <tr><td colspan="6" class="empty">Memuat...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="enroll" class="section">
+        <div class="card">
+          <h2>Daftar Siswa Baru</h2>
+          <div class="form-grid">
+            <label>Nama Siswa</label>
+            <input id="enroll-name" type="text" placeholder="Contoh: Budi Santoso" />
+            <label>NISN</label>
+            <input id="enroll-nisn" type="text" placeholder="Contoh: 1234567890" />
+            <label>Kelas / JKK</label>
+            <input id="enroll-class" type="text" placeholder="Contoh: Autis" />
+            <label>ID Fingerprint</label>
+            <input id="enroll-id" type="number" min="1" max="127" placeholder="1-127" />
+          </div>
+          <div class="actions">
+            <button id="enroll-start" class="btn bg">Mulai Enrollment</button>
+            <button id="enroll-cancel" class="btn br">Batal</button>
+          </div>
+          <div id="enroll-message" class="message info">Silakan isi data dan klik Mulai Enrollment.</div>
+        </div>
+      </section>
+
+      <section id="attendance" class="section">
+        <div class="attendance-grid">
+          <article class="card attendance-card">
+            <h2>Live Camera Stream</h2>
+            <div class="stream-box">
+              <img id="live-stream" src="" alt="Live camera stream" />
+              <div class="stream-label">Silakan tempatkan jari pada sensor fingerprint.</div>
+            </div>
+            <p class="hint">Tab ini menampilkan stream langsung dari ESP32. Popup akan muncul saat finger valid.</p>
+          </article>
+          <article class="card attendance-summary">
+            <h2>Status Absensi</h2>
+            <p id="attendance-status" class="message info">Menunggu ESP32 dan finger...</p>
+            <ul class="attendance-details">
+              <li><strong>Finger ID:</strong> <span id="attendance-finger-id">-</span></li>
+              <li><strong>Nama:</strong> <span id="attendance-name">-</span></li>
+              <li><strong>Kelas:</strong> <span id="attendance-class">-</span></li>
+              <li><strong>Waktu:</strong> <span id="attendance-time">-</span></li>
+            </ul>
+          </article>
+        </div>
+        <div id="attendance-popup" class="popup-overlay hidden">
+          <div class="popup-card">
+            <strong>Absensi Terdeteksi</strong>
+            <div class="popup-body">
+              <img id="popup-photo" src="" alt="Foto absensi" />
+              <div class="popup-info">
+                <p><strong>Nama:</strong> <span id="popup-name">-</span></p>
+                <p><strong>Kelas:</strong> <span id="popup-class">-</span></p>
+                <p><strong>NISN:</strong> <span id="popup-nisn">-</span></p>
+                <p><strong>ID Finger:</strong> <span id="popup-id">-</span></p>
+                <p><strong>Waktu:</strong> <span id="popup-time">-</span></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="students" class="section">
+        <div class="card">
+          <h2>Data Siswa</h2>
+          <div id="students-list">Memuat...</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
